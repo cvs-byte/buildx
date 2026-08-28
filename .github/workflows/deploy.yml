@@ -1,0 +1,62 @@
+name: Deploy AcademyGrowth to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: 'pages'
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Build Application Bundle
+        run: npm run build
+        env:
+          VITE_COGNITO_USER_POOL_ID: us-east-1_4IYy9fOND
+          VITE_COGNITO_CLIENT_ID: 25f1pvpper6aiije0ufdod082l
+          VITE_COGNITO_DOMAIN: https://us-east-14iyy9fond.auth.us-east-1.amazoncognito.com
+          VITE_COGNITO_REDIRECT_URI: https://academygrowth.in/callback
+          VITE_COGNITO_LOGOUT_URI: https://academygrowth.in/login
+          VITE_API_URL: https://academygrowth.in/api
+          VITE_AWS_REGION: us-east-1
+
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Build Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './dist'
+
+  deploy:
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

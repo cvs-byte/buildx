@@ -1,0 +1,7 @@
+{
+  "Name": "academygrowth-oac",
+  "Description": "OAC for AcademyGrowth S3 frontend",
+  "SigningProtocol": "sigv4",
+  "SigningBehavior": "always",
+  "OriginAccessControlOriginType": "s3"
+}
