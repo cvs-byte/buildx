@@ -6,8 +6,9 @@ import { TenantProvider } from './contexts/TenantContext';
 import { AppRoutes } from './routes/AppRoutes';
 
 export const App: React.FC = () => {
+  const routerBasename = import.meta.env.BASE_URL.replace(/\/$/, '') || '/';
   return (
-    <BrowserRouter basename={import.meta.env.BASE_URL}>
+    <BrowserRouter basename={routerBasename}>
       <ToastProvider>
         <AuthProvider>
           <TenantProvider>
