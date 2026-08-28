@@ -8,6 +8,7 @@ import { getDashboardForRole } from '../utils/constants';
 // Public Pages
 import { HomePage } from '../pages/public/HomePage';
 import { LoginPage } from '../pages/auth/LoginPage';
+import { QRTestPage } from '../pages/test/QRTestPage';
 
 // System Admin / Super Admin (Platform Scope)
 import { SystemAdminDashboard } from '../pages/systemAdmin/SystemAdminDashboard';
@@ -77,6 +78,9 @@ export const AppRoutes: React.FC = () => {
       <Route path="/resources" element={<HomePage />} />
       <Route path="/contact" element={<HomePage />} />
       <Route path="/faq" element={<HomePage />} />
+
+      {/* Standalone QR Diagnostic Page (Zero API Dependency) */}
+      <Route path="/qr-test" element={<QRTestPage />} />
 
       {/* Auth Public Routes */}
       <Route
