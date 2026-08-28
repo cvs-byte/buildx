@@ -154,8 +154,20 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
     async (targetCameraId?: string) => {
       await stopScanner();
 
-      const element = document.getElementById('teacher-qr-reader');
-      if (!element) return;
+      // Retry finding DOM element if modal is still animating mount
+      let element = document.getElementById('teacher-qr-reader');
+      let retries = 0;
+      while (!element && retries < 10) {
+        await new Promise((r) => setTimeout(r, 50));
+        element = document.getElementById('teacher-qr-reader');
+        retries++;
+      }
+
+      if (!element) {
+        console.warn('[CAMERA ERROR] #teacher-qr-reader DOM element not mounted.');
+        setScannerStatus('CAMERA_ERROR');
+        return;
+      }
 
       setScannerStatus('REQUESTING_CAMERA');
 
@@ -163,8 +175,9 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
         const html5Qrcode = new Html5Qrcode('teacher-qr-reader', false);
         html5QrcodeRef.current = html5Qrcode;
 
+        let devices: CameraDevice[] = [];
         try {
-          const devices = await Html5Qrcode.getCameras();
+          devices = await Html5Qrcode.getCameras();
           if (devices && devices.length > 0) {
             setAvailableCameras(devices);
             if (!targetCameraId && !selectedCameraId) {
@@ -183,29 +196,40 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
           // Camera list query fallback
         }
 
-        const cameraConfig = targetCameraId
+        const scannerConfig = {
+          fps: 25,
+          qrbox: (w: number, h: number) => ({
+            width: Math.floor(w * 0.95),
+            height: Math.floor(h * 0.95),
+          }),
+          aspectRatio: 1.0,
+        };
+
+        const onScan = (decodedText: string) => {
+          handleProcessScan(decodedText);
+        };
+
+        const primaryConfig = targetCameraId
           ? targetCameraId
           : selectedCameraId
           ? selectedCameraId
           : { facingMode: 'environment' };
 
-        await html5Qrcode.start(
-          cameraConfig,
-          {
-            fps: 25,
-            qrbox: (w, h) => ({
-              width: Math.floor(w * 0.95),
-              height: Math.floor(h * 0.95),
-            }),
-            aspectRatio: 1.0,
-          },
-          (decodedText) => {
-            handleProcessScan(decodedText);
-          },
-          () => {
-            // Normal scan frame miss
+        try {
+          await html5Qrcode.start(primaryConfig, scannerConfig, onScan, () => {});
+        } catch (primaryErr) {
+          console.warn('[CAMERA START FALLBACK 1] Rear camera constraint failed. Retrying with user camera...', primaryErr);
+          try {
+            await html5Qrcode.start({ facingMode: 'user' }, scannerConfig, onScan, () => {});
+          } catch (secondaryErr) {
+            console.warn('[CAMERA START FALLBACK 2] Retrying with first available device ID...', secondaryErr);
+            if (devices && devices.length > 0) {
+              await html5Qrcode.start(devices[0].id, scannerConfig, onScan, () => {});
+            } else {
+              throw secondaryErr;
+            }
           }
-        );
+        }
 
         setScannerStatus('SCANNING');
       } catch (err: any) {
@@ -439,6 +463,20 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
                 {parsedUserId && (
                   <div>Parsed Student User ID: <span className="text-emerald-400 font-bold">{parsedUserId}</span></div>
                 )}
+              </div>
+            )}
+
+            {/* Developer-Only Debug Panel */}
+            {import.meta.env.DEV && (
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl text-[11px] font-mono text-emerald-400 space-y-1">
+                <div className="flex justify-between items-center text-indigo-400 font-bold border-b border-slate-800 pb-1">
+                  <span>[DEV DEBUG PANEL]</span>
+                  <span>{scannerStatus}</span>
+                </div>
+                <div className="truncate">QR Raw: <span className="text-slate-200">{lastScannedRaw || 'Waiting for scan...'}</span></div>
+                <div>Extracted User ID: <span className="text-cyan-400 font-bold">{parsedUserId || 'N/A'}</span></div>
+                <div>Matched Student: <span className="text-emerald-300 font-bold">{verificationResult?.student?.name || (isValidating ? 'Searching database...' : 'None')}</span></div>
+                <div>Attendance Status: <span className="text-amber-300">{verificationResult?.status || 'IDLE'}</span></div>
               </div>
             )}
           </div>

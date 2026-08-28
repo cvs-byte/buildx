@@ -110,15 +110,28 @@ export const QRScannerModal: React.FC<QRScannerModalProps> = ({
       await stopScanner();
       setHasCameraError(false);
 
-      const element = document.getElementById('student-qr-reader');
-      if (!element) return;
+      // Retry finding DOM element if modal is still animating mount
+      let element = document.getElementById('student-qr-reader');
+      let retries = 0;
+      while (!element && retries < 10) {
+        await new Promise((r) => setTimeout(r, 50));
+        element = document.getElementById('student-qr-reader');
+        retries++;
+      }
+
+      if (!element) {
+        console.warn('[CAMERA ERROR] #student-qr-reader DOM element not mounted.');
+        setHasCameraError(true);
+        return;
+      }
 
       try {
         const html5Qrcode = new Html5Qrcode('student-qr-reader', false);
         html5QrcodeRef.current = html5Qrcode;
 
+        let devices: CameraDevice[] = [];
         try {
-          const devices = await Html5Qrcode.getCameras();
+          devices = await Html5Qrcode.getCameras();
           if (devices && devices.length > 0) {
             setAvailableCameras(devices);
             if (!targetCameraId && !selectedCameraId) {
@@ -137,30 +150,41 @@ export const QRScannerModal: React.FC<QRScannerModalProps> = ({
           // Camera list fallback
         }
 
-        const cameraConfig = targetCameraId
+        const scannerConfig = {
+          fps: 25,
+          qrbox: (w: number, h: number) => ({
+            width: Math.floor(w * 0.95),
+            height: Math.floor(h * 0.95),
+          }),
+          aspectRatio: 1.0,
+        };
+
+        const onScan = (decodedText: string) => {
+          stopScanner();
+          handleValidateToken(decodedText);
+        };
+
+        const primaryConfig = targetCameraId
           ? targetCameraId
           : selectedCameraId
           ? selectedCameraId
           : { facingMode: 'environment' };
 
-        await html5Qrcode.start(
-          cameraConfig,
-          {
-            fps: 25,
-            qrbox: (w, h) => ({
-              width: Math.floor(w * 0.95),
-              height: Math.floor(h * 0.95),
-            }),
-            aspectRatio: 1.0,
-          },
-          (decodedText) => {
-            stopScanner();
-            handleValidateToken(decodedText);
-          },
-          () => {
-            // Normal scan frame miss
+        try {
+          await html5Qrcode.start(primaryConfig, scannerConfig, onScan, () => {});
+        } catch (primaryErr) {
+          console.warn('[STUDENT CAMERA FALLBACK 1] Retrying with user camera...', primaryErr);
+          try {
+            await html5Qrcode.start({ facingMode: 'user' }, scannerConfig, onScan, () => {});
+          } catch (secondaryErr) {
+            console.warn('[STUDENT CAMERA FALLBACK 2] Retrying with first available device ID...', secondaryErr);
+            if (devices && devices.length > 0) {
+              await html5Qrcode.start(devices[0].id, scannerConfig, onScan, () => {});
+            } else {
+              throw secondaryErr;
+            }
           }
-        );
+        }
       } catch (err: any) {
         console.error('[STUDENT QR SCANNER ERROR]', err);
         setHasCameraError(true);
