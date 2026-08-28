@@ -3,7 +3,8 @@ import { UserProfile } from '../types';
 export const authService = {
   async signIn(): Promise<void> {
     const clientId = import.meta.env.VITE_COGNITO_CLIENT_ID || '25f1pvpper6aiije0ufdod082l';
-    const redirectUri = import.meta.env.VITE_COGNITO_REDIRECT_URI || `${window.location.origin}/callback`;
+    const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+    const redirectUri = import.meta.env.VITE_COGNITO_REDIRECT_URI || `${window.location.origin}${base}callback`;
     const cognitoDomain = import.meta.env.VITE_COGNITO_DOMAIN;
     const authority = import.meta.env.VITE_COGNITO_AUTHORITY || 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_4IYy9fOND';
 
@@ -18,7 +19,8 @@ export const authService = {
   },
 
   async signOut(): Promise<void> {
-    const logoutUri = import.meta.env.VITE_COGNITO_LOGOUT_URI || window.location.origin;
+    const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+    const logoutUri = import.meta.env.VITE_COGNITO_LOGOUT_URI || `${window.location.origin}${base}`;
     const clientId = import.meta.env.VITE_COGNITO_CLIENT_ID || '25f1pvpper6aiije0ufdod082l';
     const cognitoDomain = import.meta.env.VITE_COGNITO_DOMAIN;
 

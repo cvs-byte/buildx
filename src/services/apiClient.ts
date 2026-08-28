@@ -2,11 +2,12 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
 function getOidcAccessToken(): string | null {
   try {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
     const oidcKeyPrefix = 'oidc.user:';
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
       if (key && key.startsWith(oidcKeyPrefix)) {
-        const itemStr = localStorage.getItem(key);
+        const itemStr = window.localStorage.getItem(key);
         if (itemStr) {
           const parsed = JSON.parse(itemStr);
           if (parsed && parsed.access_token) {
@@ -16,7 +17,7 @@ function getOidcAccessToken(): string | null {
       }
     }
   } catch {
-    // Ignore JSON parsing errors
+    // Ignore storage & parsing errors
   }
   return null;
 }

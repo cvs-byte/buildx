@@ -23,8 +23,12 @@ function handleUnauthorized(): void {
       detail: { message: 'Your session has expired. Please log in again.' },
     })
   );
-  if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
-    window.location.replace('/login');
+  if (typeof window !== 'undefined') {
+    const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+    const loginPath = `${base}/login`;
+    if (window.location.pathname !== loginPath && window.location.pathname !== '/login') {
+      window.location.replace(loginPath);
+    }
   }
 }
 
