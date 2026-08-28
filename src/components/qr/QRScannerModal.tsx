@@ -134,17 +134,6 @@ export const QRScannerModal: React.FC<QRScannerModalProps> = ({
           devices = await Html5Qrcode.getCameras();
           if (devices && devices.length > 0) {
             setAvailableCameras(devices);
-            if (!targetCameraId && !selectedCameraId) {
-              const backCam = devices.find(
-                (d) =>
-                  d.label.toLowerCase().includes('back') ||
-                  d.label.toLowerCase().includes('rear') ||
-                  d.label.toLowerCase().includes('environment')
-              );
-              const defaultCamId = backCam ? backCam.id : devices[0].id;
-              setSelectedCameraId(defaultCamId);
-              targetCameraId = defaultCamId;
-            }
           }
         } catch {
           // Camera list fallback
@@ -166,22 +155,24 @@ export const QRScannerModal: React.FC<QRScannerModalProps> = ({
 
         const primaryConfig = targetCameraId
           ? targetCameraId
-          : selectedCameraId
-          ? selectedCameraId
           : { facingMode: 'environment' };
 
         try {
           await html5Qrcode.start(primaryConfig, scannerConfig, onScan, () => {});
         } catch (primaryErr) {
-          console.warn('[STUDENT CAMERA FALLBACK 1] Retrying with user camera...', primaryErr);
+          console.warn('[STUDENT CAMERA FALLBACK 1] Environmental camera failed. Retrying with user webcam...', primaryErr);
           try {
             await html5Qrcode.start({ facingMode: 'user' }, scannerConfig, onScan, () => {});
           } catch (secondaryErr) {
-            console.warn('[STUDENT CAMERA FALLBACK 2] Retrying with first available device ID...', secondaryErr);
-            if (devices && devices.length > 0) {
-              await html5Qrcode.start(devices[0].id, scannerConfig, onScan, () => {});
-            } else {
-              throw secondaryErr;
+            console.warn('[STUDENT CAMERA FALLBACK 2] Trying generic camera constraints...', secondaryErr);
+            try {
+              await html5Qrcode.start(true as any, scannerConfig, onScan, () => {});
+            } catch (tertiaryErr) {
+              if (devices && devices.length > 0) {
+                await html5Qrcode.start(devices[0].id, scannerConfig, onScan, () => {});
+              } else {
+                throw tertiaryErr;
+              }
             }
           }
         }
