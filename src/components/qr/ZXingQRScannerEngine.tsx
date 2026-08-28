@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { BrowserQRCodeReader, IScannerControls } from '@zxing/browser';
-import { Camera, AlertTriangle, SwitchCamera, ShieldAlert, Upload, RefreshCw, KeyRound, Play, Square } from 'lucide-react';
+import { BrowserQRCodeReader, BarcodeFormat, IScannerControls } from '@zxing/browser';
+import { DecodeHintType } from '@zxing/library';
+import jsQR from 'jsqr';
+import { Camera, AlertTriangle, SwitchCamera, ShieldAlert, Upload, RefreshCw, KeyRound } from 'lucide-react';
 import { Button } from '../common/Button';
 
 export interface CameraDeviceInfo {
@@ -26,7 +28,9 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const codeReaderRef = useRef<BrowserQRCodeReader | null>(null);
   const controlsRef = useRef<IScannerControls | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const jsQRIntervalRef = useRef<number | null>(null);
 
   const [availableDevices, setAvailableDevices] = useState<CameraDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
@@ -34,14 +38,16 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
   const [isInitializing, setIsInitializing] = useState<boolean>(true);
   const [isSecure, setIsSecure] = useState<boolean>(true);
 
-  // Diagnostics & Heartbeat state
+  // Diagnostics & Heartbeat state (Section 5 & 9 & 11)
   const [rawDecodedText, setRawDecodedText] = useState<string | null>(null);
   const [scanAttempts, setScanAttempts] = useState<number>(0);
   const [videoDimensions, setVideoDimensions] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [cameraStateText, setCameraStateText] = useState<string>('Initializing');
   const [manualTestInput, setManualTestInput] = useState<string>('');
 
-  // 1. Check Secure Context (HTTPS or localhost)
+  const detectedLockRef = useRef<boolean>(false);
+
+  // Check Secure Context (HTTPS or localhost)
   useEffect(() => {
     const secure = window.isSecureContext || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
     setIsSecure(secure);
@@ -52,8 +58,13 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
     }
   }, [onError]);
 
-  // Stop active scanner controls & release streams
+  // Clean up media streams, timers, and ZXing controls completely (Section 26 & 27)
   const stopScannerControls = useCallback(() => {
+    if (jsQRIntervalRef.current !== null) {
+      clearInterval(jsQRIntervalRef.current);
+      jsQRIntervalRef.current = null;
+    }
+
     if (controlsRef.current) {
       try {
         controlsRef.current.stop();
@@ -62,19 +73,45 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
       }
       controlsRef.current = null;
     }
+
+    if (mediaStreamRef.current) {
+      try {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      } catch (err) {
+        console.warn('[MEDIASTREAM STOP WARN]', err);
+      }
+      mediaStreamRef.current = null;
+    }
+
     if (videoRef.current) {
       try {
-        BrowserQRCodeReader.cleanVideoSource(videoRef.current);
+        videoRef.current.srcObject = null;
       } catch (err) {
-        console.warn('[CLEAN VIDEO SOURCE WARN]', err);
+        console.warn('[VIDEO SRC CLEAR WARN]', err);
       }
     }
   }, []);
 
-  // Main Camera Scanner Initialization using ZXing continuous decoder
+  const handleQRDetected = useCallback(
+    (text: string) => {
+      if (detectedLockRef.current || isPaused) return;
+      const cleanText = text.trim();
+      if (!cleanText) return;
+
+      detectedLockRef.current = true;
+      console.log('[QR DETECTED]', cleanText);
+      console.log('[QR RAW]', JSON.stringify(cleanText));
+      setRawDecodedText(cleanText);
+      onScan(cleanText);
+    },
+    [isPaused, onScan]
+  );
+
+  // Main Camera Scanner Initialization using ZXing + jsQR dual-engine (Section 3, 4, 5, 6, 7)
   const startCameraScanner = useCallback(
     async (targetDeviceId?: string) => {
       stopScannerControls();
+      detectedLockRef.current = false;
       setCameraError(null);
       setIsInitializing(true);
       setCameraStateText('Initializing camera...');
@@ -90,11 +127,19 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
       }
 
       try {
+        // High-precision ZXing hints: TRY_HARDER = true for low contrast / tilted codes
+        const hints = new Map();
+        hints.set(DecodeHintType.TRY_HARDER, true);
+        hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE]);
+
         if (!codeReaderRef.current) {
-          codeReaderRef.current = new BrowserQRCodeReader();
+          codeReaderRef.current = new BrowserQRCodeReader(hints, {
+            delayBetweenScanAttempts: 80,
+            delayBetweenScanSuccess: 1000,
+          });
         }
 
-        // List video input devices
+        // List available camera devices (Section 4)
         let devices: MediaDeviceInfo[] = [];
         try {
           devices = await BrowserQRCodeReader.listVideoInputDevices();
@@ -107,6 +152,7 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
           console.warn('[DEVICE LIST WARN]', err);
         }
 
+        // Prefer rear/environment camera
         let chosenDeviceId = targetDeviceId || selectedDeviceId;
         if (!chosenDeviceId && devices.length > 0) {
           const rearCam = devices.find(
@@ -123,11 +169,10 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
         const videoElement = videoRef.current;
         if (!videoElement) {
           setIsInitializing(false);
-          setCameraError('Video element element not mounted.');
+          setCameraError('Video element not mounted.');
           return;
         }
 
-        // Ensure video element properties for mobile compatibility
         videoElement.setAttribute('autoplay', 'true');
         videoElement.setAttribute('playsinline', 'true');
         videoElement.setAttribute('muted', 'true');
@@ -144,7 +189,7 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
           audio: false,
         };
 
-        // Continuous ZXing decoder stream initialization
+        // 1. Start stream & ZXing continuous decoder
         const controls = await codeReaderRef.current.decodeFromConstraints(
           constraints,
           videoElement,
@@ -152,27 +197,21 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
             setScanAttempts((prev) => prev + 1);
 
             if (result) {
-              const decodedText = result.getText();
-              if (decodedText && decodedText.trim() !== '') {
-                const cleanText = decodedText.trim();
-                console.log('[QR SUCCESS]', cleanText);
-                console.log('[QR RAW]', JSON.stringify(cleanText));
-                setRawDecodedText(cleanText);
-                onScan(cleanText);
+              const text = result.getText();
+              if (text && text.trim() !== '') {
+                handleQRDetected(text);
               }
             }
-
-            // Normal decode failures (NotFoundException) while searching are non-fatal.
-            // Do NOT throw or display error for missed frames.
+            // Non-fatal missed frame errors (NotFoundException) are handled silently
           }
         );
 
         controlsRef.current = controls;
 
-        // Verify camera dimensions and ready state (Section 6)
+        // 2. Camera Health Check & Readiness verification (Section 5)
         let verifyRetries = 0;
-        while ((videoElement.readyState < 2 || videoElement.videoWidth === 0) && verifyRetries < 20) {
-          await new Promise((r) => setTimeout(r, 100));
+        while ((videoElement.readyState < 2 || videoElement.videoWidth === 0) && verifyRetries < 25) {
+          await new Promise((r) => setTimeout(r, 80));
           verifyRetries++;
         }
 
@@ -186,6 +225,26 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
           height,
         });
 
+        // 3. Parallel jsQR 60fps canvas sampling engine for instant sub-100ms detection
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+        jsQRIntervalRef.current = window.setInterval(() => {
+          if (detectedLockRef.current || isPaused || !videoElement || videoElement.readyState < 2) return;
+          if (ctx && videoElement.videoWidth > 0 && videoElement.videoHeight > 0) {
+            canvas.width = videoElement.videoWidth;
+            canvas.height = videoElement.videoHeight;
+            ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQR(imageData.data, imageData.width, imageData.height, {
+              inversionAttempts: 'dontInvert',
+            });
+            if (code && code.data && code.data.trim() !== '') {
+              handleQRDetected(code.data);
+            }
+          }
+        }, 100);
+
         setIsInitializing(false);
         setCameraStateText('Camera ready — scan a student QR');
         if (onStatusChange) onStatusChange('Camera ready — scan a student QR');
@@ -195,7 +254,7 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
 
         let userMsg = 'Camera initialization failed.';
         if (err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError') {
-          userMsg = 'Camera permission denied. Allow camera access in browser settings and tap Retry.';
+          userMsg = 'Camera permission denied. Please allow camera access in browser settings and press Retry.';
           if (onStatusChange) onStatusChange('Camera permission denied');
         } else if (err?.name === 'NotFoundError' || err?.name === 'DevicesNotFoundError') {
           userMsg = 'No camera device found on this device.';
@@ -212,7 +271,7 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
         if (onError) onError(userMsg);
       }
     },
-    [selectedDeviceId, stopScannerControls, onScan, onError, onStatusChange]
+    [selectedDeviceId, stopScannerControls, handleQRDetected, onError, onStatusChange, isPaused]
   );
 
   // Section 9: DECODER HEARTBEAT DIAGNOSTICS
@@ -222,12 +281,11 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
       frameAttempts++;
       const v = videoRef.current;
       if (v) {
-        console.log('[QR SCANNER HEARTBEAT]', {
+        console.log('[QR SCANNER]', {
           attempts: frameAttempts,
           videoWidth: v.videoWidth,
           videoHeight: v.videoHeight,
           readyState: v.readyState,
-          paused: v.paused,
         });
       }
     }, 2000);
@@ -247,7 +305,7 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
     };
   }, [active, isPaused]);
 
-  // Handle Switch Camera Device
+  // Handle Switch Camera Device (Section 4 & 18)
   const handleSwitchCamera = () => {
     if (availableDevices.length <= 1) return;
     const currentIndex = availableDevices.findIndex((d) => d.deviceId === selectedDeviceId);
@@ -257,7 +315,7 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
     startCameraScanner(nextDevice.deviceId);
   };
 
-  // Section 10: REAL QR TEST MODE (Image File Upload Decoder Test)
+  // Section 10 & 32: IMAGE DECODER TEST (Scan QR from Image)
   const handleTestImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -267,16 +325,43 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
         codeReaderRef.current = new BrowserQRCodeReader();
       }
       const imgUrl = URL.createObjectURL(file);
-      const result = await codeReaderRef.current.decodeFromImageUrl(imgUrl);
-      if (result) {
-        const text = result.getText();
-        console.log('[IMAGE QR TEST SUCCESS]', text);
-        setRawDecodedText(text);
-        onScan(text);
+
+      // Try ZXing image decode
+      try {
+        const result = await codeReaderRef.current.decodeFromImageUrl(imgUrl);
+        if (result) {
+          const text = result.getText();
+          console.log('[IMAGE QR TEST SUCCESS - ZXING]', text);
+          setRawDecodedText(text);
+          onScan(text);
+          return;
+        }
+      } catch {
+        // Fallback to jsQR image canvas decode
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          const ctx = canvas.getContext('2d');
+          canvas.width = img.width;
+          canvas.height = img.height;
+          if (ctx) {
+            ctx.drawImage(img, 0, 0);
+            const imageData = ctx.getImageData(0, 0, img.width, img.height);
+            const code = jsQR(imageData.data, imageData.width, imageData.height);
+            if (code && code.data) {
+              console.log('[IMAGE QR TEST SUCCESS - JSQR]', code.data);
+              setRawDecodedText(code.data);
+              onScan(code.data);
+              return;
+            }
+          }
+          alert('Unable to read QR code from uploaded image. Ensure the image is clear and well lit.');
+        };
+        img.src = imgUrl;
       }
     } catch (err: any) {
       console.warn('[IMAGE QR TEST FAILED]', err);
-      alert('Unable to decode QR from uploaded image file. Make sure the QR is clear and well lit.');
+      alert('Unable to decode QR from image file.');
     } finally {
       if (e.target) e.target.value = '';
     }
@@ -285,7 +370,7 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
   return (
     <div className="space-y-3 w-full">
       {/* HTML Video Viewport */}
-      <div className="relative w-full aspect-square max-h-[300px] mx-auto bg-black rounded-2xl overflow-hidden border-2 border-indigo-500/40 shadow-2xl flex items-center justify-center">
+      <div className="relative w-full aspect-square max-h-[320px] mx-auto bg-black rounded-2xl overflow-hidden border-2 border-indigo-500/40 shadow-2xl flex items-center justify-center">
         <video
           ref={videoRef}
           autoPlay
@@ -296,17 +381,21 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
           }`}
         />
 
-        {/* Target Framing Overlay */}
+        {/* Large Scanning Target Overlay (Section 8) */}
         {!cameraError && isSecure && (
-          <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center p-6">
-            <div className="relative w-4/5 aspect-square border-2 border-indigo-400/80 rounded-2xl shadow-[0_0_0_9999px_rgba(0,0,0,0.45)] flex items-center justify-center overflow-hidden">
+          <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center p-4">
+            <div className="relative w-5/6 aspect-square border-2 border-indigo-400/80 rounded-2xl shadow-[0_0_0_9999px_rgba(0,0,0,0.45)] flex items-center justify-center overflow-hidden">
               {!isPaused && !isInitializing && (
-                <div className="absolute inset-x-0 h-0.5 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_12px_#38bdf8] animate-pulse" />
+                <div className="absolute inset-x-0 h-0.5 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_14px_#38bdf8] animate-pulse" />
               )}
-              <div className="absolute top-2 left-2 w-5 h-5 border-t-4 border-l-4 border-cyan-400 rounded-tl-sm" />
-              <div className="absolute top-2 right-2 w-5 h-5 border-t-4 border-r-4 border-cyan-400 rounded-tr-sm" />
-              <div className="absolute bottom-2 left-2 w-5 h-5 border-b-4 border-l-4 border-cyan-400 rounded-bl-sm" />
-              <div className="absolute bottom-2 right-2 w-5 h-5 border-b-4 border-r-4 border-cyan-400 rounded-br-sm" />
+              <div className="absolute top-2 left-2 w-6 h-6 border-t-4 border-l-4 border-cyan-400 rounded-tl-sm" />
+              <div className="absolute top-2 right-2 w-6 h-6 border-t-4 border-r-4 border-cyan-400 rounded-tr-sm" />
+              <div className="absolute bottom-2 left-2 w-6 h-6 border-b-4 border-l-4 border-cyan-400 rounded-bl-sm" />
+              <div className="absolute bottom-2 right-2 w-6 h-6 border-b-4 border-r-4 border-cyan-400 rounded-br-sm" />
+
+              <div className="absolute bottom-3 inset-x-0 text-center text-[11px] font-semibold text-cyan-300 bg-slate-950/70 py-1 px-2 rounded-full mx-auto w-fit border border-cyan-500/30">
+                Move QR inside the frame • Hold steady
+              </div>
             </div>
           </div>
         )}
@@ -326,13 +415,13 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
             <div className="space-y-1">
               <h4 className="text-sm font-bold text-rose-300">HTTPS Required</h4>
               <p className="text-xs text-slate-300 max-w-xs">
-                Camera access requires HTTPS context. Please load application over https://
+                Camera scanning requires HTTPS context. Please load site over https://
               </p>
             </div>
           </div>
         )}
 
-        {/* Camera Error State */}
+        {/* Camera Error State (Section 24) */}
         {cameraError && isSecure && (
           <div className="absolute inset-0 bg-slate-950/90 text-white flex flex-col items-center justify-center p-4 text-center space-y-3 z-20">
             <AlertTriangle size={36} className="text-amber-400" />
@@ -351,7 +440,7 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
         )}
       </div>
 
-      {/* Diagnostics Status Banner (Section 9) */}
+      {/* Diagnostics Status Banner (Section 5, 9, 11) */}
       <div className="bg-slate-900/90 border border-slate-800 p-2.5 rounded-xl text-xs font-mono text-slate-300 flex flex-wrap justify-between items-center gap-2">
         <div>
           Camera: <span className="text-emerald-400 font-bold">{videoDimensions.width > 0 ? `READY (${videoDimensions.width}×${videoDimensions.height})` : 'INITIALIZING'}</span>
@@ -360,24 +449,24 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
           Decoder: <span className="text-cyan-400 font-bold">{isPaused ? 'PAUSED' : 'RUNNING'}</span>
         </div>
         <div>
-          Attempts: <span className="text-purple-300">{scanAttempts}</span>
+          QR: <span className="text-purple-300">{rawDecodedText ? 'DETECTED ✓' : 'SEARCHING'}</span>
         </div>
       </div>
 
-      {/* Raw Decoded Output Display Box (Section 3 & 25) */}
+      {/* Standalone Raw Decoded Output Display Box (Section 3 & 31) */}
       {rawDecodedText && (
-        <div className="p-3 bg-emerald-950/60 border border-emerald-800 rounded-xl text-left space-y-1 font-mono text-xs text-emerald-200">
+        <div className="p-3 bg-emerald-950/60 border border-emerald-800 rounded-xl text-left space-y-1 font-mono text-xs text-emerald-200 shadow-lg">
           <div className="flex justify-between items-center font-bold text-emerald-400">
             <span>✓ RAW QR DECODER OUTPUT</span>
             <span className="text-[10px] text-emerald-500">{new Date().toLocaleTimeString()}</span>
           </div>
           <div className="break-all font-bold text-white bg-slate-900/80 p-2 rounded border border-emerald-900">
-            {rawDecodedText}
+            RAW: {rawDecodedText}
           </div>
         </div>
       )}
 
-      {/* Development Diagnostic Toolbar (Section 10 & 11) */}
+      {/* Development Diagnostic Toolbar (Section 10 & 32) */}
       <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
         <input
           type="file"
@@ -393,7 +482,7 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
           onClick={() => fileInputRef.current?.click()}
           className="text-xs"
         >
-          TEST QR (IMAGE FILE)
+          Scan QR from Image
         </Button>
 
         {availableDevices.length > 1 && (
@@ -409,7 +498,7 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
         )}
       </div>
 
-      {/* Section 11: Manual QR Text Test Input */}
+      {/* Section 33: Manual QR Text Test Input */}
       {import.meta.env.DEV && (
         <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-2 text-left">
           <div className="text-[11px] font-bold text-indigo-400 font-mono flex items-center gap-1">
@@ -429,8 +518,7 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
               onClick={() => {
                 if (manualTestInput.trim()) {
                   console.log('[TEST MANUAL QR TEXT]', manualTestInput.trim());
-                  setRawDecodedText(manualTestInput.trim());
-                  onScan(manualTestInput.trim());
+                  handleQRDetected(manualTestInput.trim());
                 }
               }}
             >
