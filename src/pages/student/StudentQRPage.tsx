@@ -36,8 +36,9 @@ export const StudentQRPage: React.FC = () => {
 
   // Canonical attendance QR payload
   const qrPayload = JSON.stringify({
-    type: 'ACADEMY_ATTENDANCE',
+    type: 'ACADEMY_STUDENT',
     version: 1,
+    studentId: String(userId),
     userId: String(userId),
   });
 

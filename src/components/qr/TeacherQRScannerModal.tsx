@@ -1,14 +1,25 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Html5Qrcode, Html5QrcodeSupportedFormats, CameraDevice } from 'html5-qrcode';
 import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
 import { Input } from '../common/Input';
 import { attendanceApi } from '../../api/attendance.api';
 import { useToast } from '../../hooks/useToast';
-import type { StudentQRVerificationResult, ScanResultCode } from '../../types/attendance.types';
-import { Camera, CheckCircle2, AlertTriangle, XCircle, RefreshCw, KeyRound, ShieldAlert, Clock, Users, UserCheck } from 'lucide-react';
-
-import jsQR from 'jsqr';
 import { parseStudentQR } from '../../utils/qrParser';
+import type { StudentQRVerificationResult } from '../../types/attendance.types';
+import {
+  Camera,
+  CheckCircle2,
+  AlertTriangle,
+  XCircle,
+  KeyRound,
+  ShieldAlert,
+  Users,
+  UserCheck,
+  Upload,
+  RefreshCw,
+  SwitchCamera,
+} from 'lucide-react';
 
 export interface TeacherQRScannerModalProps {
   isOpen: boolean;
@@ -20,6 +31,19 @@ export interface TeacherQRScannerModalProps {
   scannedCount?: number;
   totalStudents?: number;
 }
+
+export type ScannerStatusState =
+  | 'IDLE'
+  | 'REQUESTING_CAMERA'
+  | 'CAMERA_READY'
+  | 'SCANNING'
+  | 'PROCESSING'
+  | 'SUCCESS'
+  | 'INVALID_QR'
+  | 'STUDENT_NOT_FOUND'
+  | 'WRONG_CLASS'
+  | 'ALREADY_PRESENT'
+  | 'CAMERA_ERROR';
 
 export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
   isOpen,
@@ -39,27 +63,47 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
   const [lastScannedRaw, setLastScannedRaw] = useState<string | null>(null);
   const [parsedUserId, setParsedUserId] = useState<string | null>(null);
 
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const [hasCameraPermission, setHasCameraPermission] = useState<boolean | null>(null);
-  const isCooldownRef = useRef<boolean>(false);
+  const [availableCameras, setAvailableCameras] = useState<CameraDevice[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState<string>('');
+  const [scannerStatus, setScannerStatus] = useState<ScannerStatusState>('IDLE');
 
-  const stopCameraStream = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
+  const html5QrcodeRef = useRef<Html5Qrcode | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const processingRef = useRef<boolean>(false);
+
+  const stopScanner = useCallback(async () => {
+    if (html5QrcodeRef.current) {
+      try {
+        if (html5QrcodeRef.current.isScanning) {
+          await html5QrcodeRef.current.stop();
+        }
+        html5QrcodeRef.current.clear();
+      } catch (err) {
+        console.warn('[HTML5QRCODE STOP WARN]', err);
+      } finally {
+        html5QrcodeRef.current = null;
+      }
     }
   }, []);
 
   const handleProcessScan = useCallback(
     async (rawQRString: string) => {
-      if (isCooldownRef.current) return;
+      if (processingRef.current) return;
       if (!rawQRString || rawQRString.trim() === '') return;
 
-      isCooldownRef.current = true;
+      processingRef.current = true;
       setIsValidating(true);
+      setScannerStatus('PROCESSING');
       setVerificationResult(null);
+
+      console.log('[QR RAW]', rawQRString);
+      setLastScannedRaw(rawQRString);
+
+      const parsed = parseStudentQR(rawQRString);
+      console.log('[QR PARSED]', parsed);
+      if (parsed?.userId) {
+        setParsedUserId(parsed.userId);
+      }
 
       try {
         const result = await attendanceApi.validateStudentQRScan({
@@ -72,14 +116,24 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
         setVerificationResult(result);
 
         if (result.success && result.status === 'PRESENT') {
+          setScannerStatus('SUCCESS');
           showToast('success', `✓ Verified! ${result.student?.name || 'Student'} marked PRESENT.`);
           if (onScanSuccess) onScanSuccess(result);
         } else if (result.status === 'ALREADY_RECORDED') {
+          setScannerStatus('ALREADY_PRESENT');
           showToast('error', `Error: Attendance already marked for ${result.student?.name || 'student'} today.`);
+        } else if (result.status === 'WRONG_CLASS') {
+          setScannerStatus('WRONG_CLASS');
+          showToast('error', result.message);
+        } else if (result.status === 'USER_NOT_FOUND') {
+          setScannerStatus('STUDENT_NOT_FOUND');
+          showToast('error', result.message);
         } else {
+          setScannerStatus('INVALID_QR');
           showToast('error', result.message);
         }
       } catch (err: any) {
+        setScannerStatus('INVALID_QR');
         setVerificationResult({
           success: false,
           status: 'INVALID_TOKEN',
@@ -88,110 +142,118 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
         showToast('error', 'Scan verification error.');
       } finally {
         setIsValidating(false);
-        // Resumes scanner loop automatically after 1.8s
         setTimeout(() => {
-          isCooldownRef.current = false;
+          processingRef.current = false;
         }, 1800);
       }
     },
     [selectedClass, selectedSection, attendanceDate, onScanSuccess, showToast]
   );
 
-  const startCamera = useCallback(async () => {
-    stopCameraStream();
-    setHasCameraPermission(null);
+  const startScanner = useCallback(
+    async (targetCameraId?: string) => {
+      await stopScanner();
 
-    try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        setHasCameraPermission(false);
-        setActiveTab('MANUAL');
-        return;
-      }
+      const element = document.getElementById('teacher-qr-reader');
+      if (!element) return;
 
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' },
-      });
+      setScannerStatus('REQUESTING_CAMERA');
 
-      streamRef.current = mediaStream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
-        await videoRef.current.play();
-      }
-      setHasCameraPermission(true);
-    } catch {
-      setHasCameraPermission(false);
-    }
-  }, [stopCameraStream]);
+      try {
+        const html5Qrcode = new Html5Qrcode('teacher-qr-reader', false);
+        html5QrcodeRef.current = html5Qrcode;
 
-  // Frame scanning loop using jsQR + BarcodeDetector fallback
-  useEffect(() => {
-    let animFrameId: number;
-
-    if (isOpen && activeTab === 'CAMERA' && hasCameraPermission) {
-      const scanFrame = async () => {
-        if (!isCooldownRef.current && videoRef.current && videoRef.current.readyState === videoRef.current.HAVE_ENOUGH_DATA) {
-          const video = videoRef.current;
-          const canvas = canvasRef.current;
-          if (video && canvas) {
-            const ctx = canvas.getContext('2d', { willReadFrequently: true });
-            if (ctx) {
-              canvas.width = video.videoWidth;
-              canvas.height = video.videoHeight;
-              ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-              let detectedVal: string | null = null;
-              if ('BarcodeDetector' in window) {
-                try {
-                  const detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
-                  const barcodes = await detector.detect(video);
-                  if (barcodes.length > 0) {
-                    detectedVal = barcodes[0].rawValue;
-                  }
-                } catch {
-                  // Fall back to jsQR
-                }
-              }
-
-              if (!detectedVal) {
-                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                const code = jsQR(imageData.data, imageData.width, imageData.height, {
-                  inversionAttempts: 'dontInvert',
-                });
-                if (code && code.data) {
-                  detectedVal = code.data;
-                }
-              }
-
-              if (detectedVal) {
-                setLastScannedRaw(detectedVal);
-                const parsed = parseStudentQR(detectedVal);
-                if (parsed?.userId) {
-                  setParsedUserId(parsed.userId);
-                }
-                handleProcessScan(detectedVal);
-              }
+        try {
+          const devices = await Html5Qrcode.getCameras();
+          if (devices && devices.length > 0) {
+            setAvailableCameras(devices);
+            if (!targetCameraId && !selectedCameraId) {
+              const backCam = devices.find(
+                (d) =>
+                  d.label.toLowerCase().includes('back') ||
+                  d.label.toLowerCase().includes('rear') ||
+                  d.label.toLowerCase().includes('environment')
+              );
+              const defaultCamId = backCam ? backCam.id : devices[0].id;
+              setSelectedCameraId(defaultCamId);
+              targetCameraId = defaultCamId;
             }
           }
+        } catch {
+          // Camera list query fallback
         }
-        animFrameId = requestAnimationFrame(scanFrame);
-      };
 
-      scanFrame();
+        const cameraConfig = targetCameraId
+          ? targetCameraId
+          : selectedCameraId
+          ? selectedCameraId
+          : { facingMode: 'environment' };
+
+        await html5Qrcode.start(
+          cameraConfig,
+          {
+            fps: 10,
+            qrbox: { width: 240, height: 240 },
+            aspectRatio: 1.0,
+          },
+          (decodedText) => {
+            handleProcessScan(decodedText);
+          },
+          () => {
+            // Normal scan frame miss
+          }
+        );
+
+        setScannerStatus('SCANNING');
+      } catch (err: any) {
+        console.error('[HTML5QRCODE START ERROR]', err);
+        setScannerStatus('CAMERA_ERROR');
+      }
+    },
+    [selectedCameraId, stopScanner, handleProcessScan]
+  );
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const tempScanner = new Html5Qrcode('teacher-qr-reader', false);
+      const decodedText = await tempScanner.scanFile(file, true);
+      console.log('[UPLOADED QR RAW]', decodedText);
+      handleProcessScan(decodedText);
+    } catch {
+      showToast('error', 'Unable to read student QR code from uploaded image.');
+    } finally {
+      if (e.target) e.target.value = '';
     }
+  };
 
-    return () => {
-      if (animFrameId) cancelAnimationFrame(animFrameId);
-    };
-  }, [isOpen, activeTab, hasCameraPermission, handleProcessScan]);
+  const handleSwitchCamera = () => {
+    if (availableCameras.length <= 1) return;
+    const currentIndex = availableCameras.findIndex((c) => c.id === selectedCameraId);
+    const nextIndex = (currentIndex + 1) % availableCameras.length;
+    const nextCamId = availableCameras[nextIndex].id;
+    setSelectedCameraId(nextCamId);
+    startScanner(nextCamId);
+  };
 
   useEffect(() => {
     if (isOpen && activeTab === 'CAMERA') {
-      startCamera();
+      const timer = setTimeout(() => {
+        startScanner();
+      }, 100);
+      return () => {
+        clearTimeout(timer);
+        stopScanner();
+      };
     } else {
-      stopCameraStream();
+      stopScanner();
     }
-    return () => stopCameraStream();
-  }, [isOpen, activeTab, startCamera, stopCameraStream]);
+    return () => {
+      stopScanner();
+    };
+  }, [isOpen, activeTab, startScanner, stopScanner]);
 
   const renderVerificationCard = (res: StudentQRVerificationResult) => {
     switch (res.status) {
@@ -202,10 +264,15 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
               <CheckCircle2 size={24} />
             </div>
             <div className="flex-1 text-left">
-              <span className="block text-xs font-bold text-emerald-800 dark:text-emerald-300">✓ Student Verified & Marked PRESENT</span>
-              <span className="block text-sm font-black text-slate-800 dark:text-slate-100">{res.student?.name}</span>
+              <span className="block text-xs font-bold text-emerald-800 dark:text-emerald-300">
+                ✓ Student Verified & Marked PRESENT
+              </span>
+              <span className="block text-sm font-black text-slate-800 dark:text-slate-100">
+                {res.student?.name}
+              </span>
               <span className="block text-[10px] text-emerald-700 dark:text-emerald-400">
-                User ID: {res.student?.userId || res.student?.id} | Roll: {res.student?.rollNumber || 'CS-2026'} | Time: {res.markedAt || 'Just now'}
+                User ID: {res.student?.userId || res.student?.id} | Roll: {res.student?.rollNumber || 'CS-2026'} | Time:{' '}
+                {res.markedAt || 'Just now'}
               </span>
             </div>
           </div>
@@ -313,36 +380,51 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
 
         {/* Viewport */}
         {activeTab === 'CAMERA' ? (
-          <div className="space-y-2">
-            <div className="ag-scan-viewport relative aspect-square max-h-[270px] w-full mx-auto bg-black rounded-2xl overflow-hidden flex items-center justify-center">
-              <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
-              <canvas ref={canvasRef} className="hidden" />
+          <div className="space-y-3">
+            <div className="relative aspect-square max-h-[280px] w-full mx-auto bg-black rounded-2xl overflow-hidden border-2 border-indigo-500/30 flex items-center justify-center shadow-xl">
+              <div id="teacher-qr-reader" className="w-full h-full object-cover" />
 
-              {/* Laser Scan Beam Animation */}
-              <div className="ag-scan-beam-line" />
-
-              {/* Target Guide Corners */}
-              <div className="absolute inset-8 border border-indigo-400/50 rounded-2xl pointer-events-none flex flex-col justify-between p-2 shadow-2xl">
-                <div className="flex justify-between">
-                  <div className="w-5 h-5 border-t-2 border-l-2 border-cyan-400" />
-                  <div className="w-5 h-5 border-t-2 border-r-2 border-cyan-400" />
-                </div>
-                <div className="flex justify-between">
-                  <div className="w-5 h-5 border-b-2 border-l-2 border-cyan-400" />
-                  <div className="w-5 h-5 border-b-2 border-r-2 border-cyan-400" />
-                </div>
-              </div>
-
-              {hasCameraPermission === false && (
+              {scannerStatus === 'CAMERA_ERROR' && (
                 <div className="absolute inset-0 bg-slate-900/90 text-white flex flex-col items-center justify-center p-4 text-center space-y-2">
                   <AlertTriangle size={32} className="text-amber-400" />
                   <p className="text-xs font-medium">Camera access unavailable or permission denied.</p>
-                  <Button size="sm" variant="outline" onClick={() => setActiveTab('MANUAL')}>
-                    Switch to Manual User ID Entry
+                  <Button size="sm" variant="outline" onClick={() => startScanner()}>
+                    <RefreshCw size={14} className="mr-1" /> Retry Camera
                   </Button>
                 </div>
               )}
             </div>
+
+            {/* Camera Controls & File Upload Toolbar */}
+            <div className="flex items-center justify-between gap-2 pt-1">
+              <input
+                type="file"
+                ref={fileInputRef}
+                accept="image/*"
+                className="hidden"
+                onChange={handleFileUpload}
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                leftIcon={<Upload size={14} />}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                Upload QR Image
+              </Button>
+
+              {availableCameras.length > 1 && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  leftIcon={<SwitchCamera size={14} />}
+                  onClick={handleSwitchCamera}
+                >
+                  Switch Camera ({availableCameras.length})
+                </Button>
+              )}
+            </div>
+
             {/* Live Scan Debug Status Banner */}
             {lastScannedRaw && (
               <div className="p-2.5 bg-slate-900 border border-slate-800 rounded-xl text-[11px] font-mono text-slate-300 space-y-1">
@@ -356,9 +438,6 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
                 )}
               </div>
             )}
-            <p className="text-[11px] text-slate-400 text-center">
-              Point camera at student's personal QR pass. Next scan ready automatically.
-            </p>
           </div>
         ) : (
           <form
@@ -382,7 +461,7 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
               isLoading={isValidating}
               leftIcon={<CheckCircle2 size={16} />}
             >
-              Lookup & Verify Student
+              TEST ATTENDANCE WITH STUDENT ID
             </Button>
           </form>
         )}

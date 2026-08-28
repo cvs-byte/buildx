@@ -28,6 +28,9 @@ export const StudentQRCardModal: React.FC<StudentQRCardModalProps> = ({
 
   // Encodes JSON payload or canonical userId
   const qrPayload = JSON.stringify({
+    type: 'ACADEMY_STUDENT',
+    version: 1,
+    studentId: studentId,
     userId: studentId,
     name: studentName,
     tenantId: currentUser?.schoolId || currentUser?.tenantId || 'OIC-MAIN',

@@ -82,11 +82,17 @@ export const attendanceApi = {
     selectedSection: string;
     date?: string;
   }): Promise<StudentQRVerificationResult> {
+    console.log("========== QR DETECTED ==========");
+    console.log("[QR RAW]", params.rawQR);
+
     const activeTenantId = storage.getSchoolId() || 'sch-001';
     const currentDate = params.date || new Date().toISOString().split('T')[0];
     const parsedQR = parseStudentQR(params.rawQR);
 
+    console.log("[QR PARSED]", parsedQR);
+
     if (!parsedQR || !parsedQR.userId) {
+      console.warn("[QR SCAN ERROR] Unable to parse student User ID from QR code:", params.rawQR);
       return {
         success: false,
         status: 'INVALID_TOKEN',
@@ -95,6 +101,7 @@ export const attendanceApi = {
     }
 
     const scannedUserId = parsedQR.userId;
+    console.log("[STUDENT LOOKUP ID]", scannedUserId);
 
     // Load real users directly from canonical Users API: https://api.academygrowth.in/Users
     let allUsers: User[] = [];
@@ -115,6 +122,7 @@ export const attendanceApi = {
       (u) =>
         u.userId === scannedUserId ||
         u.id === scannedUserId ||
+        u.rollNumber === scannedUserId ||
         u.email?.toLowerCase() === scannedUserId.toLowerCase() ||
         (scannedUserId.includes('@') && u.email?.toLowerCase() === scannedUserId.toLowerCase())
     );
@@ -126,6 +134,7 @@ export const attendanceApi = {
           (u) =>
             u.userId === scannedUserId ||
             u.id === scannedUserId ||
+            u.rollNumber === scannedUserId ||
             u.email?.toLowerCase() === scannedUserId.toLowerCase()
         );
       } catch {
@@ -133,7 +142,10 @@ export const attendanceApi = {
       }
     }
 
+    console.log("[STUDENT LOOKUP RESULT]", student);
+
     if (!student) {
+      console.warn(`[STUDENT LOOKUP FAILED] Student "${scannedUserId}" not found in database.`);
       return {
         success: false,
         status: 'USER_NOT_FOUND',
@@ -144,6 +156,7 @@ export const attendanceApi = {
     // Role validation
     const isStudentRole = String(student.role || '').toUpperCase() === 'STUDENT';
     if (!isStudentRole) {
+      console.warn(`[ROLE CHECK FAILED] User "${student.name}" has non-student role "${student.role}".`);
       return {
         success: false,
         status: 'UNAUTHORIZED',
@@ -155,6 +168,7 @@ export const attendanceApi = {
     // Active status validation
     const isActiveStatus = String(student.status || 'ACTIVE').toUpperCase() === 'ACTIVE';
     if (!isActiveStatus) {
+      console.warn(`[STATUS CHECK FAILED] Student account "${student.name}" is inactive.`);
       return {
         success: false,
         status: 'UNAUTHORIZED',
@@ -166,6 +180,7 @@ export const attendanceApi = {
     // Multi-Tenant Isolation Check
     const studentTenantId = student.schoolId || student.tenantId;
     if (activeTenantId && studentTenantId && activeTenantId !== studentTenantId) {
+      console.warn(`[TENANT CHECK FAILED] Student tenant "${studentTenantId}" differs from active tenant "${activeTenantId}".`);
       return {
         success: false,
         status: 'UNAUTHORIZED',
@@ -174,8 +189,14 @@ export const attendanceApi = {
       };
     }
 
+    console.log("[SELECTED CLASS]", params.selectedClass);
+    console.log("[SELECTED SECTION]", params.selectedSection);
+    console.log("[STUDENT CLASS]", student.classIds || student.gradeLevel);
+    console.log("[STUDENT SECTION]", student.section);
+
     // Class Membership Check
     if (params.selectedClass && !studentBelongsToClass(student, params.selectedClass)) {
+      console.warn(`[CLASS CHECK FAILED] Student "${student.name}" does not belong to selected class "${params.selectedClass}".`);
       return {
         success: false,
         status: 'WRONG_CLASS',
@@ -197,12 +218,20 @@ export const attendanceApi = {
       remarks: 'Scanned Student Personal QR Pass',
     };
 
+    console.log("[ATTENDANCE REQUEST]", {
+      endpoint: '/attendance',
+      method: 'PUT/POST',
+      payload,
+    });
+
     try {
       let savedRecord: AttendanceRecord;
       try {
         savedRecord = await this.updateAttendance(payload);
+        console.log("[ATTENDANCE RESPONSE]", savedRecord);
       } catch (err: any) {
         if (err?.status === 409) {
+          console.warn("[ATTENDANCE RESPONSE 409]", `Attendance already recorded for ${student.name} today.`);
           return {
             success: false,
             status: 'ALREADY_RECORDED',
@@ -223,6 +252,7 @@ export const attendanceApi = {
         record: savedRecord,
       };
     } catch (err: any) {
+      console.error("[ATTENDANCE RESPONSE ERROR]", err);
       if (err?.status === 409 || err?.message?.includes('already')) {
         return {
           success: false,
