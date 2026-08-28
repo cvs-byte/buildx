@@ -7,6 +7,9 @@ import { useToast } from '../../hooks/useToast';
 import type { StudentQRVerificationResult, ScanResultCode } from '../../types/attendance.types';
 import { Camera, CheckCircle2, AlertTriangle, XCircle, RefreshCw, KeyRound, ShieldAlert, Clock, Users, UserCheck } from 'lucide-react';
 
+import jsQR from 'jsqr';
+import { parseStudentQR } from '../../utils/qrParser';
+
 export interface TeacherQRScannerModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -33,6 +36,8 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
   const [manualInput, setManualInput] = useState('');
   const [isValidating, setIsValidating] = useState(false);
   const [verificationResult, setVerificationResult] = useState<StudentQRVerificationResult | null>(null);
+  const [lastScannedRaw, setLastScannedRaw] = useState<string | null>(null);
+  const [parsedUserId, setParsedUserId] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -118,23 +123,53 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
     }
   }, [stopCameraStream]);
 
-  // Frame scanning loop
+  // Frame scanning loop using jsQR + BarcodeDetector fallback
   useEffect(() => {
     let animFrameId: number;
 
     if (isOpen && activeTab === 'CAMERA' && hasCameraPermission) {
       const scanFrame = async () => {
         if (!isCooldownRef.current && videoRef.current && videoRef.current.readyState === videoRef.current.HAVE_ENOUGH_DATA) {
-          if ('BarcodeDetector' in window) {
-            try {
-              const detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
-              const barcodes = await detector.detect(videoRef.current);
-              if (barcodes.length > 0) {
-                const detectedVal = barcodes[0].rawValue;
+          const video = videoRef.current;
+          const canvas = canvasRef.current;
+          if (video && canvas) {
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            if (ctx) {
+              canvas.width = video.videoWidth;
+              canvas.height = video.videoHeight;
+              ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+              let detectedVal: string | null = null;
+              if ('BarcodeDetector' in window) {
+                try {
+                  const detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
+                  const barcodes = await detector.detect(video);
+                  if (barcodes.length > 0) {
+                    detectedVal = barcodes[0].rawValue;
+                  }
+                } catch {
+                  // Fall back to jsQR
+                }
+              }
+
+              if (!detectedVal) {
+                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const code = jsQR(imageData.data, imageData.width, imageData.height, {
+                  inversionAttempts: 'dontInvert',
+                });
+                if (code && code.data) {
+                  detectedVal = code.data;
+                }
+              }
+
+              if (detectedVal) {
+                setLastScannedRaw(detectedVal);
+                const parsed = parseStudentQR(detectedVal);
+                if (parsed?.userId) {
+                  setParsedUserId(parsed.userId);
+                }
                 handleProcessScan(detectedVal);
               }
-            } catch {
-              // Ignore BarcodeDetector errors
             }
           }
         }
@@ -308,6 +343,19 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
                 </div>
               )}
             </div>
+            {/* Live Scan Debug Status Banner */}
+            {lastScannedRaw && (
+              <div className="p-2.5 bg-slate-900 border border-slate-800 rounded-xl text-[11px] font-mono text-slate-300 space-y-1">
+                <div className="flex justify-between items-center text-indigo-400 font-bold">
+                  <span>QR DETECTED & DECODED</span>
+                  <span>{new Date().toLocaleTimeString()}</span>
+                </div>
+                <div className="truncate">Payload: <span className="text-slate-200 font-semibold">{lastScannedRaw}</span></div>
+                {parsedUserId && (
+                  <div>Parsed Student User ID: <span className="text-emerald-400 font-bold">{parsedUserId}</span></div>
+                )}
+              </div>
+            )}
             <p className="text-[11px] text-slate-400 text-center">
               Point camera at student's personal QR pass. Next scan ready automatically.
             </p>

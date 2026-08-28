@@ -6,6 +6,8 @@ export interface ParsedStudentQR {
   userId: string;
   email?: string;
   tenantId?: string;
+  type?: string;
+  version?: number;
   raw: string;
 }
 
@@ -19,29 +21,34 @@ export function parseStudentQR(rawInput: string): ParsedStudentQR | null {
     return null;
   }
 
-  // 1. Try parsing JSON format: { "userId": "std_101", "email": "..." }
+  // 1. Try parsing JSON format: { "type": "ACADEMY_ATTENDANCE", "userId": "..." }
   if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
     try {
       const parsed = JSON.parse(trimmed);
-      const userId = parsed.userId || parsed.id || parsed.user_id || parsed.studentId;
-      if (userId && typeof userId === 'string' && userId.trim() !== '') {
-        return {
-          userId: userId.trim(),
-          email: parsed.email,
-          tenantId: parsed.tenantId || parsed.schoolId,
-          raw: trimmed,
-        };
+      const userId = parsed.userId || parsed.id || parsed.user_id || parsed.studentId || parsed.rollNumber || parsed.email;
+      if (userId && (typeof userId === 'string' || typeof userId === 'number')) {
+        const cleanUserId = String(userId).trim();
+        if (cleanUserId !== '') {
+          return {
+            userId: cleanUserId,
+            email: parsed.email,
+            tenantId: parsed.tenantId || parsed.schoolId,
+            type: parsed.type,
+            version: parsed.version,
+            raw: trimmed,
+          };
+        }
       }
     } catch {
       // Not JSON, continue
     }
   }
 
-  // 2. Try parsing URL query parameter: https://academygrowth.in/student?userId=std_101
+  // 2. Try parsing URL query parameter
   if (trimmed.includes('?') || trimmed.includes('://')) {
     try {
       const url = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
-      const userId = url.searchParams.get('userId') || url.searchParams.get('id') || url.searchParams.get('studentId');
+      const userId = url.searchParams.get('userId') || url.searchParams.get('id') || url.searchParams.get('studentId') || url.searchParams.get('email');
       if (userId && userId.trim() !== '') {
         return {
           userId: userId.trim(),
