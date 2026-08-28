@@ -22,11 +22,30 @@ export function parseStudentQR(rawInput: string): ParsedStudentQR | null {
     return null;
   }
 
-  // 1. Try parsing JSON format: { "type": "ACADEMY_STUDENT", "studentId": "..." }
-  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+  // 1. Try parsing JSON format
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('"') && trimmed.endsWith('"'))) {
     try {
-      const parsed = JSON.parse(trimmed);
-      const targetId = parsed.studentId || parsed.userId || parsed.id || parsed.user_id || parsed.rollNumber || parsed.email;
+      let unescaped: any = trimmed;
+      if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+        unescaped = JSON.parse(trimmed);
+      }
+      if (typeof unescaped === 'string' && unescaped.startsWith('{')) {
+        unescaped = JSON.parse(unescaped);
+      }
+
+      const parsed = typeof unescaped === 'object' && unescaped !== null ? unescaped : JSON.parse(trimmed);
+
+      const targetId =
+        parsed.studentId ||
+        parsed.userId ||
+        parsed.id ||
+        parsed.user_id ||
+        parsed.student_id ||
+        parsed.USERID ||
+        parsed.STUDENTID ||
+        parsed.rollNumber ||
+        parsed.email;
+
       if (targetId && (typeof targetId === 'string' || typeof targetId === 'number')) {
         const cleanUserId = String(targetId).trim();
         if (cleanUserId !== '') {
@@ -46,11 +65,26 @@ export function parseStudentQR(rawInput: string): ParsedStudentQR | null {
     }
   }
 
-  // 2. Try parsing URL query parameter
+  // 2. Try regex extraction from JSON-like key/value strings
+  const jsonIdMatch = trimmed.match(/"(?:userId|studentId|id|user_id|student_id)"\s*:\s*"([^"]+)"/i);
+  if (jsonIdMatch && jsonIdMatch[1]) {
+    const cleanId = jsonIdMatch[1].trim();
+    return {
+      userId: cleanId,
+      studentId: cleanId,
+      raw: trimmed,
+    };
+  }
+
+  // 3. Try parsing URL query parameter
   if (trimmed.includes('?') || trimmed.includes('://')) {
     try {
       const url = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
-      const targetId = url.searchParams.get('studentId') || url.searchParams.get('userId') || url.searchParams.get('id') || url.searchParams.get('email');
+      const targetId =
+        url.searchParams.get('studentId') ||
+        url.searchParams.get('userId') ||
+        url.searchParams.get('id') ||
+        url.searchParams.get('email');
       if (targetId && targetId.trim() !== '') {
         const cleanId = targetId.trim();
         return {
@@ -64,7 +98,7 @@ export function parseStudentQR(rawInput: string): ParsedStudentQR | null {
     }
   }
 
-  // 3. Try parsing prefixed string: USER:std_101 or STUDENT:std_101
+  // 4. Try parsing prefixed string: USER:std_101 or STUDENT:std_101
   if (trimmed.toUpperCase().startsWith('USER:') || trimmed.toUpperCase().startsWith('STUDENT:')) {
     const parts = trimmed.split(':');
     if (parts.length >= 2 && parts[1].trim() !== '') {
@@ -77,7 +111,7 @@ export function parseStudentQR(rawInput: string): ParsedStudentQR | null {
     }
   }
 
-  // 4. Treat raw string directly as User ID if valid format
+  // 5. Treat raw string directly as User ID if valid format
   const sanitizedId = trimmed.replace(/[^a-zA-Z0-9_\-@.]/g, '');
   if (sanitizedId.length > 0) {
     return {

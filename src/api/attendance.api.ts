@@ -106,41 +106,32 @@ export const attendanceApi = {
     // Load real users directly from canonical Users API: https://api.academygrowth.in/Users
     let allUsers: User[] = [];
     try {
-      allUsers = activeTenantId
-        ? await userApi.getUsersBySchool(activeTenantId)
-        : await userApi.getAllUsers();
+      allUsers = await userApi.getAllUsers();
     } catch {
       try {
-        allUsers = await userApi.getAllUsers();
+        allUsers = activeTenantId
+          ? await userApi.getUsersBySchool(activeTenantId)
+          : [];
       } catch {
         allUsers = [];
       }
     }
 
-    // O(1) Student Lookup in real users database
-    let student = allUsers.find(
-      (u) =>
-        u.userId === scannedUserId ||
-        u.id === scannedUserId ||
-        u.rollNumber === scannedUserId ||
-        u.email?.toLowerCase() === scannedUserId.toLowerCase() ||
-        (scannedUserId.includes('@') && u.email?.toLowerCase() === scannedUserId.toLowerCase())
-    );
+    const cleanScannedId = String(scannedUserId).trim().toLowerCase();
 
-    if (!student) {
-      try {
-        const globalUsers = await userApi.getAllUsers();
-        student = globalUsers.find(
-          (u) =>
-            u.userId === scannedUserId ||
-            u.id === scannedUserId ||
-            u.rollNumber === scannedUserId ||
-            u.email?.toLowerCase() === scannedUserId.toLowerCase()
-        );
-      } catch {
-        // Ignore fallback error
-      }
-    }
+    // Fast multi-field student lookup in real users database
+    let student = allUsers.find((u) => {
+      const uid = String(u.userId || u.id || '').trim().toLowerCase();
+      const roll = String(u.rollNumber || '').trim().toLowerCase();
+      const em = String(u.email || '').trim().toLowerCase();
+      return (
+        uid === cleanScannedId ||
+        roll === cleanScannedId ||
+        em === cleanScannedId ||
+        (cleanScannedId.length >= 3 && uid.includes(cleanScannedId)) ||
+        (cleanScannedId.length >= 3 && cleanScannedId.includes(uid))
+      );
+    });
 
     console.log("[STUDENT LOOKUP RESULT]", student);
 
