@@ -17,10 +17,10 @@ import {
   ShieldAlert,
   Users,
   UserCheck,
-  RefreshCw,
   Play,
   Square,
   WifiOff,
+  RefreshCw,
 } from 'lucide-react';
 
 export interface TeacherQRScannerModalProps {
@@ -72,11 +72,11 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
   const [lastScannedRaw, setLastScannedRaw] = useState<string | null>(null);
   const [parsedStudentId, setParsedStudentId] = useState<string | null>(null);
 
-  // Duplicate protection refs for the session
+  // Session duplicate protection
   const isProcessingRef = useRef<boolean>(false);
   const scannedStudentsRef = useRef<Set<string>>(new Set());
 
-  // Reset scanner session on modal open/close
+  // Reset modal session state on open
   useEffect(() => {
     if (isOpen) {
       isProcessingRef.current = false;
@@ -99,19 +99,20 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
       setIsPaused(true);
       setIsValidating(true);
       setVerificationResult(null);
+      setStatusText('QR detected');
 
-      // Section 6 REQUIRED DEBUG LOG: [QR] Raw decoded value
-      console.log('[QR] Raw decoded value:', rawDecodedText);
-      setLastScannedRaw(rawDecodedText);
+      // Section 12 & Section 25 REQUIRED DEBUG LOG: [QR RAW]
+      console.log('[QR RAW]', JSON.stringify(rawDecodedText.trim()));
+      console.log('[QR] Raw decoded value:', rawDecodedText.trim());
+      setLastScannedRaw(rawDecodedText.trim());
 
-      // Parse payload
-      const qrData = parseStudentQR(rawDecodedText);
-      // Section 6 REQUIRED DEBUG LOG: [QR] Parsed data
+      // Parse payload using centralized parser
+      const qrData = parseStudentQR(rawDecodedText.trim());
       console.log('[QR] Parsed data:', qrData);
 
       if (!qrData || !qrData.studentId) {
         setStatusText('Invalid student QR');
-        showToast('error', 'Invalid student QR');
+        showToast('error', 'Invalid student QR code format.');
         setIsValidating(false);
         setTimeout(() => {
           isProcessingRef.current = false;
@@ -120,11 +121,10 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
       }
 
       const studentId = qrData.studentId;
-      // Section 6 REQUIRED DEBUG LOG: [QR] Student ID
       console.log('[QR] Student ID:', studentId);
       setParsedStudentId(studentId);
 
-      // Section 7 DUPLICATE SCAN PROTECTION
+      // Section 14: Duplicate Scan Protection for session
       if (scannedStudentsRef.current.has(studentId)) {
         setStatusText('Already marked');
         showToast('warning', `Student (${studentId}) already scanned in this session.`);
@@ -150,19 +150,17 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
         status: 'PRESENT',
       };
 
-      // Section 6 REQUIRED DEBUG LOG: [ATTENDANCE] Request
       console.log('[ATTENDANCE] Request:', payload);
       setStatusText('Marking attendance...');
 
       try {
         const response = await attendanceApi.validateStudentQRScan({
-          rawQR: rawDecodedText,
+          rawQR: rawDecodedText.trim(),
           selectedClass,
           selectedSection,
           date: attendanceDate,
         });
 
-        // Section 6 REQUIRED DEBUG LOG: [ATTENDANCE] Response
         console.log('[ATTENDANCE] Response:', response);
         setVerificationResult(response);
 
@@ -186,12 +184,12 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
           showToast('error', response.message || 'Invalid student QR');
         }
       } catch (err: any) {
-        console.error('[ATTENDANCE ERROR]', err);
+        console.error('[ATTENDANCE RESPONSE ERROR]', err);
         setStatusText('Network error');
         setVerificationResult({
           success: false,
           status: 'INVALID_TOKEN',
-          message: err?.message || 'Unable to connect to attendance server. Your scan was not marked. Please try again.',
+          message: err?.message || 'Unable to connect to attendance server. Scan was not marked. Please try again.',
         });
         showToast('error', 'Network error. Attendance NOT marked.');
       } finally {
@@ -371,7 +369,7 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
           {/* Verification Result Notification Card */}
           {verificationResult && renderVerificationResultCard(verificationResult)}
 
-          {/* Camera Viewport */}
+          {/* Camera Viewport & Decoder Engine */}
           {activeTab === 'CAMERA' ? (
             <div className="space-y-3">
               <ZXingQRScannerEngine
@@ -425,20 +423,6 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
                   </Button>
                 )}
               </div>
-
-              {/* Development Debug Mode Panel */}
-              {import.meta.env.DEV && (
-                <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl text-[11px] font-mono text-emerald-400 space-y-1">
-                  <div className="flex justify-between items-center text-indigo-400 font-bold border-b border-slate-800 pb-1">
-                    <span>[DEV DEBUG MODE]</span>
-                    <span>{statusText}</span>
-                  </div>
-                  <div className="truncate">Raw decoded value: <span className="text-slate-200">{lastScannedRaw || 'N/A'}</span></div>
-                  <div>Student ID: <span className="text-cyan-400 font-bold">{parsedStudentId || 'N/A'}</span></div>
-                  <div>Processing State: <span className="text-amber-300">{isProcessingRef.current ? 'LOCKED' : 'IDLE'}</span></div>
-                  <div>Session Set Count: <span className="text-purple-300">{scannedStudentsRef.current.size}</span></div>
-                </div>
-              )}
             </div>
           ) : (
             <form
