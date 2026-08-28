@@ -1,14 +1,16 @@
 /**
- * Robust, safe parser for Student Personal QR codes.
- * Extracts the canonical `userId` from plain strings, JSON payloads, prefixes, or URLs.
+ * Production-grade, safe parser for Student QR payloads.
+ * Strictly validates QR structure:
+ * Preferred payload: { "v": 1, "type": "student", "studentId": "STU001" }
+ * Supports legacy formats if matching valid student ID format.
  */
 export interface ParsedStudentQR {
-  userId: string;
   studentId: string;
+  userId: string;
+  version?: number;
+  type?: string;
   email?: string;
   tenantId?: string;
-  type?: string;
-  version?: number;
   raw: string;
 }
 
@@ -25,101 +27,74 @@ export function parseStudentQR(rawInput: string): ParsedStudentQR | null {
   // 1. Try parsing JSON format
   if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('"') && trimmed.endsWith('"'))) {
     try {
-      let unescaped: any = trimmed;
+      let parsedObj: any = trimmed;
       if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
-        unescaped = JSON.parse(trimmed);
+        parsedObj = JSON.parse(trimmed);
       }
-      if (typeof unescaped === 'string' && unescaped.startsWith('{')) {
-        unescaped = JSON.parse(unescaped);
+      if (typeof parsedObj === 'string' && parsedObj.startsWith('{')) {
+        parsedObj = JSON.parse(parsedObj);
+      }
+      if (typeof parsedObj !== 'object' || parsedObj === null) {
+        parsedObj = JSON.parse(trimmed);
       }
 
-      const parsed = typeof unescaped === 'object' && unescaped !== null ? unescaped : JSON.parse(trimmed);
+      if (typeof parsedObj === 'object' && parsedObj !== null) {
+        // Standard payload format: { v: 1, type: "student", studentId: "STU001" }
+        const version = parsedObj.v ?? parsedObj.version;
+        const type = parsedObj.type;
+        const rawStudentId =
+          parsedObj.studentId ||
+          parsedObj.userId ||
+          parsedObj.id ||
+          parsedObj.student_id ||
+          parsedObj.user_id;
 
-      const targetId =
-        parsed.studentId ||
-        parsed.userId ||
-        parsed.id ||
-        parsed.user_id ||
-        parsed.student_id ||
-        parsed.USERID ||
-        parsed.STUDENTID ||
-        parsed.rollNumber ||
-        parsed.email;
+        if (rawStudentId && (typeof rawStudentId === 'string' || typeof rawStudentId === 'number')) {
+          const cleanStudentId = String(rawStudentId).trim();
 
-      if (targetId && (typeof targetId === 'string' || typeof targetId === 'number')) {
-        const cleanUserId = String(targetId).trim();
-        if (cleanUserId !== '') {
-          return {
-            userId: cleanUserId,
-            studentId: cleanUserId,
-            email: parsed.email,
-            tenantId: parsed.tenantId || parsed.schoolId,
-            type: parsed.type,
-            version: parsed.version,
-            raw: trimmed,
-          };
+          // Reject empty or suspicious values
+          if (cleanStudentId && !cleanStudentId.includes('://') && !cleanStudentId.startsWith('{')) {
+            // Check version & type if provided
+            const isStandardFormat = version === 1 && (type === 'student' || type === 'ACADEMY_STUDENT');
+            const isLegacyJson = Boolean(type === 'ACADEMY_STUDENT' || parsedObj.studentId || parsedObj.userId);
+
+            if (isStandardFormat || isLegacyJson) {
+              return {
+                studentId: cleanStudentId,
+                userId: cleanStudentId,
+                version: typeof version === 'number' ? version : 1,
+                type: typeof type === 'string' ? type : 'student',
+                email: parsedObj.email ? String(parsedObj.email).trim() : undefined,
+                tenantId: parsedObj.tenantId || parsedObj.schoolId ? String(parsedObj.tenantId || parsedObj.schoolId).trim() : undefined,
+                raw: trimmed,
+              };
+            }
+          }
         }
       }
     } catch {
-      // Not JSON, continue
+      // Ignore JSON parse errors and fallback
     }
   }
 
-  // 2. Try regex extraction from JSON-like key/value strings
-  const jsonIdMatch = trimmed.match(/"(?:userId|studentId|id|user_id|student_id)"\s*:\s*"([^"]+)"/i);
-  if (jsonIdMatch && jsonIdMatch[1]) {
-    const cleanId = jsonIdMatch[1].trim();
+  // 2. Reject URLs, arbitrary web links, or random text with spaces/special characters
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.includes('?') || trimmed.includes('/')) {
+    return null;
+  }
+
+  // 3. Fallback: Legacy plain Student ID (e.g. STU001 or std_101 or user email / ID)
+  // Must be alphanumeric string, optionally with hyphens, underscores, dots, or at-symbols
+  const isPlainStudentIdFormat = /^[a-zA-Z0-9_\-@.]{3,64}$/.test(trimmed);
+  if (isPlainStudentIdFormat) {
     return {
-      userId: cleanId,
-      studentId: cleanId,
-      raw: trimmed,
-    };
-  }
-
-  // 3. Try parsing URL query parameter
-  if (trimmed.includes('?') || trimmed.includes('://')) {
-    try {
-      const url = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
-      const targetId =
-        url.searchParams.get('studentId') ||
-        url.searchParams.get('userId') ||
-        url.searchParams.get('id') ||
-        url.searchParams.get('email');
-      if (targetId && targetId.trim() !== '') {
-        const cleanId = targetId.trim();
-        return {
-          userId: cleanId,
-          studentId: cleanId,
-          raw: trimmed,
-        };
-      }
-    } catch {
-      // Invalid URL format, continue
-    }
-  }
-
-  // 4. Try parsing prefixed string: USER:std_101 or STUDENT:std_101
-  if (trimmed.toUpperCase().startsWith('USER:') || trimmed.toUpperCase().startsWith('STUDENT:')) {
-    const parts = trimmed.split(':');
-    if (parts.length >= 2 && parts[1].trim() !== '') {
-      const cleanId = parts[1].trim();
-      return {
-        userId: cleanId,
-        studentId: cleanId,
-        raw: trimmed,
-      };
-    }
-  }
-
-  // 5. Treat raw string directly as User ID if valid format
-  const sanitizedId = trimmed.replace(/[^a-zA-Z0-9_\-@.]/g, '');
-  if (sanitizedId.length > 0) {
-    return {
-      userId: sanitizedId,
-      studentId: sanitizedId,
+      studentId: trimmed,
+      userId: trimmed,
+      version: 1,
+      type: 'student',
       raw: trimmed,
     };
   }
 
   return null;
 }
+

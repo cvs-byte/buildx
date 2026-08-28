@@ -32,12 +32,11 @@ export const UserQRModal: React.FC<UserQRModalProps> = ({
 
   const hasValidUserId = Boolean(userId && String(userId).trim() !== '');
 
-  // Canonical attendance QR payload
+  // Canonical student attendance QR payload (Standard Format)
   const qrPayload = JSON.stringify({
-    type: 'ACADEMY_STUDENT',
-    version: 1,
+    v: 1,
+    type: 'student',
     studentId: String(userId || ''),
-    userId: String(userId || ''),
   });
 
   const handleCopyUserId = () => {

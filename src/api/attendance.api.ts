@@ -199,29 +199,45 @@ export const attendanceApi = {
     const studentCanonicalId = student.userId || student.id;
     const markedAtTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-    // Send Attendance Payload to Backend & Wait for HTTP response!
-    const payload = {
-      studentId: studentCanonicalId,
-      status: 'PRESENT' as const,
+    // Send Attendance Payload to Backend via POST to /attendance/bulk & Wait for HTTP response!
+    const bulkPayload = {
       date: currentDate,
       classId: params.selectedClass,
       sectionId: params.selectedSection,
-      remarks: 'Scanned Student Personal QR Pass',
+      records: [
+        {
+          studentId: studentCanonicalId,
+          status: 'PRESENT' as const,
+          remarks: 'Scanned Student Personal QR Pass',
+        },
+      ],
     };
 
     console.log("[ATTENDANCE REQUEST]", {
-      endpoint: '/attendance',
-      method: 'PUT/POST',
-      payload,
+      endpoint: '/attendance/bulk',
+      method: 'POST',
+      payload: bulkPayload,
     });
 
     try {
       let savedRecord: AttendanceRecord;
       try {
-        savedRecord = await this.updateAttendance(payload);
-        console.log("[ATTENDANCE RESPONSE]", savedRecord);
+        await this.submitBulkAttendance(bulkPayload);
+        savedRecord = {
+          id: `att_${studentCanonicalId}_${currentDate}`,
+          userId: studentCanonicalId,
+          userName: student.name,
+          role: 'STUDENT',
+          className: params.selectedClass,
+          department: params.selectedSection,
+          date: currentDate,
+          status: 'PRESENT',
+          checkInTime: markedAtTime,
+          remarks: 'Scanned Student Personal QR Pass',
+        };
+        console.log("[ATTENDANCE RESPONSE]", { success: true, count: 1, record: savedRecord });
       } catch (err: any) {
-        if (err?.status === 409) {
+        if (err?.status === 409 || err?.message?.includes('already')) {
           console.warn("[ATTENDANCE RESPONSE 409]", `Attendance already recorded for ${student.name} today.`);
           return {
             success: false,
@@ -231,7 +247,16 @@ export const attendanceApi = {
             markedAt: markedAtTime,
           };
         }
-        throw err;
+        // Fallback to updateAttendance if bulk route is unavailable
+        savedRecord = await this.updateAttendance({
+          studentId: studentCanonicalId,
+          status: 'PRESENT',
+          date: currentDate,
+          classId: params.selectedClass,
+          sectionId: params.selectedSection,
+          remarks: 'Scanned Student Personal QR Pass',
+        });
+        console.log("[ATTENDANCE RESPONSE FALLBACK]", savedRecord);
       }
 
       return {

@@ -1,8 +1,9 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Html5Qrcode, Html5QrcodeSupportedFormats, CameraDevice } from 'html5-qrcode';
 import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
 import { Input } from '../common/Input';
+import { ErrorBoundary } from '../common/ErrorBoundary';
+import { ZXingQRScannerEngine } from './ZXingQRScannerEngine';
 import { attendanceApi } from '../../api/attendance.api';
 import { useToast } from '../../hooks/useToast';
 import { parseStudentQR } from '../../utils/qrParser';
@@ -16,9 +17,10 @@ import {
   ShieldAlert,
   Users,
   UserCheck,
-  Upload,
   RefreshCw,
-  SwitchCamera,
+  Play,
+  Square,
+  WifiOff,
 } from 'lucide-react';
 
 export interface TeacherQRScannerModalProps {
@@ -32,18 +34,20 @@ export interface TeacherQRScannerModalProps {
   totalStudents?: number;
 }
 
-export type ScannerStatusState =
-  | 'IDLE'
-  | 'REQUESTING_CAMERA'
-  | 'CAMERA_READY'
-  | 'SCANNING'
-  | 'PROCESSING'
-  | 'SUCCESS'
-  | 'INVALID_QR'
-  | 'STUDENT_NOT_FOUND'
-  | 'WRONG_CLASS'
-  | 'ALREADY_PRESENT'
-  | 'CAMERA_ERROR';
+export type StatusDisplayText =
+  | 'Initializing camera...'
+  | 'Camera ready — scan a student QR'
+  | 'QR detected'
+  | 'Validating student...'
+  | 'Marking attendance...'
+  | 'Attendance marked successfully'
+  | 'Already marked'
+  | 'Invalid student QR'
+  | 'Student not found'
+  | 'Student does not belong to selected class/section'
+  | 'Camera permission denied'
+  | 'Camera unavailable'
+  | 'Network error';
 
 export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
   isOpen,
@@ -60,237 +64,202 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
   const [manualInput, setManualInput] = useState('');
   const [isValidating, setIsValidating] = useState(false);
   const [verificationResult, setVerificationResult] = useState<StudentQRVerificationResult | null>(null);
+
+  const [statusText, setStatusText] = useState<StatusDisplayText>('Initializing camera...');
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [isStopped, setIsStopped] = useState<boolean>(false);
+
   const [lastScannedRaw, setLastScannedRaw] = useState<string | null>(null);
-  const [parsedUserId, setParsedUserId] = useState<string | null>(null);
+  const [parsedStudentId, setParsedStudentId] = useState<string | null>(null);
 
-  const [availableCameras, setAvailableCameras] = useState<CameraDevice[]>([]);
-  const [selectedCameraId, setSelectedCameraId] = useState<string>('');
-  const [scannerStatus, setScannerStatus] = useState<ScannerStatusState>('IDLE');
+  // Duplicate protection refs for the session
+  const isProcessingRef = useRef<boolean>(false);
+  const scannedStudentsRef = useRef<Set<string>>(new Set());
 
-  const html5QrcodeRef = useRef<Html5Qrcode | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const processingRef = useRef<boolean>(false);
-
-  const stopScanner = useCallback(async () => {
-    if (html5QrcodeRef.current) {
-      try {
-        if (html5QrcodeRef.current.isScanning) {
-          await html5QrcodeRef.current.stop();
-        }
-        html5QrcodeRef.current.clear();
-      } catch (err) {
-        console.warn('[HTML5QRCODE STOP WARN]', err);
-      } finally {
-        html5QrcodeRef.current = null;
-      }
+  // Reset scanner session on modal open/close
+  useEffect(() => {
+    if (isOpen) {
+      isProcessingRef.current = false;
+      scannedStudentsRef.current.clear();
+      setIsPaused(false);
+      setIsStopped(false);
+      setVerificationResult(null);
+      setLastScannedRaw(null);
+      setParsedStudentId(null);
+      setStatusText('Initializing camera...');
     }
-  }, []);
+  }, [isOpen]);
 
   const handleProcessScan = useCallback(
-    async (rawQRString: string) => {
-      if (processingRef.current) return;
-      if (!rawQRString || rawQRString.trim() === '') return;
+    async (rawDecodedText: string) => {
+      if (isProcessingRef.current || isStopped) return;
+      if (!rawDecodedText || rawDecodedText.trim() === '') return;
 
-      processingRef.current = true;
+      isProcessingRef.current = true;
+      setIsPaused(true);
       setIsValidating(true);
-      setScannerStatus('PROCESSING');
       setVerificationResult(null);
 
-      console.log('[QR RAW]', rawQRString);
-      setLastScannedRaw(rawQRString);
+      // Section 6 REQUIRED DEBUG LOG: [QR] Raw decoded value
+      console.log('[QR] Raw decoded value:', rawDecodedText);
+      setLastScannedRaw(rawDecodedText);
 
-      const parsed = parseStudentQR(rawQRString);
-      console.log('[QR PARSED]', parsed);
-      if (parsed?.userId) {
-        setParsedUserId(parsed.userId);
+      // Parse payload
+      const qrData = parseStudentQR(rawDecodedText);
+      // Section 6 REQUIRED DEBUG LOG: [QR] Parsed data
+      console.log('[QR] Parsed data:', qrData);
+
+      if (!qrData || !qrData.studentId) {
+        setStatusText('Invalid student QR');
+        showToast('error', 'Invalid student QR');
+        setIsValidating(false);
+        setTimeout(() => {
+          isProcessingRef.current = false;
+        }, 1500);
+        return;
       }
 
+      const studentId = qrData.studentId;
+      // Section 6 REQUIRED DEBUG LOG: [QR] Student ID
+      console.log('[QR] Student ID:', studentId);
+      setParsedStudentId(studentId);
+
+      // Section 7 DUPLICATE SCAN PROTECTION
+      if (scannedStudentsRef.current.has(studentId)) {
+        setStatusText('Already marked');
+        showToast('warning', `Student (${studentId}) already scanned in this session.`);
+        setVerificationResult({
+          success: false,
+          status: 'ALREADY_RECORDED',
+          message: 'Already marked in this scan session.',
+        });
+        setIsValidating(false);
+        setTimeout(() => {
+          isProcessingRef.current = false;
+        }, 1500);
+        return;
+      }
+
+      setStatusText('Validating student...');
+
+      const payload = {
+        studentId,
+        classId: selectedClass,
+        sectionId: selectedSection,
+        date: attendanceDate || new Date().toISOString().split('T')[0],
+        status: 'PRESENT',
+      };
+
+      // Section 6 REQUIRED DEBUG LOG: [ATTENDANCE] Request
+      console.log('[ATTENDANCE] Request:', payload);
+      setStatusText('Marking attendance...');
+
       try {
-        const result = await attendanceApi.validateStudentQRScan({
-          rawQR: rawQRString.trim(),
+        const response = await attendanceApi.validateStudentQRScan({
+          rawQR: rawDecodedText,
           selectedClass,
           selectedSection,
           date: attendanceDate,
         });
 
-        setVerificationResult(result);
+        // Section 6 REQUIRED DEBUG LOG: [ATTENDANCE] Response
+        console.log('[ATTENDANCE] Response:', response);
+        setVerificationResult(response);
 
-        if (result.success && result.status === 'PRESENT') {
-          setScannerStatus('SUCCESS');
-          showToast('success', `✓ Verified! ${result.student?.name || 'Student'} marked PRESENT.`);
-          if (onScanSuccess) onScanSuccess(result);
-        } else if (result.status === 'ALREADY_RECORDED') {
-          setScannerStatus('ALREADY_PRESENT');
-          showToast('error', `Error: Attendance already marked for ${result.student?.name || 'student'} today.`);
-        } else if (result.status === 'WRONG_CLASS') {
-          setScannerStatus('WRONG_CLASS');
-          showToast('error', result.message);
-        } else if (result.status === 'USER_NOT_FOUND') {
-          setScannerStatus('STUDENT_NOT_FOUND');
-          showToast('error', result.message);
+        if (response.success && response.status === 'PRESENT') {
+          scannedStudentsRef.current.add(studentId);
+          setStatusText('Attendance marked successfully');
+          showToast('success', `✓ Attendance marked successfully for ${response.student?.name || studentId}`);
+          if (onScanSuccess) onScanSuccess(response);
+        } else if (response.status === 'ALREADY_RECORDED') {
+          scannedStudentsRef.current.add(studentId);
+          setStatusText('Already marked');
+          showToast('info', response.message || 'Already marked');
+        } else if (response.status === 'WRONG_CLASS') {
+          setStatusText('Student does not belong to selected class/section');
+          showToast('error', response.message);
+        } else if (response.status === 'USER_NOT_FOUND') {
+          setStatusText('Student not found');
+          showToast('error', response.message);
         } else {
-          setScannerStatus('INVALID_QR');
-          showToast('error', result.message);
+          setStatusText('Invalid student QR');
+          showToast('error', response.message || 'Invalid student QR');
         }
       } catch (err: any) {
-        setScannerStatus('INVALID_QR');
+        console.error('[ATTENDANCE ERROR]', err);
+        setStatusText('Network error');
         setVerificationResult({
           success: false,
           status: 'INVALID_TOKEN',
-          message: err.message || 'Error processing student QR scan.',
+          message: err?.message || 'Unable to connect to attendance server. Your scan was not marked. Please try again.',
         });
-        showToast('error', 'Scan verification error.');
+        showToast('error', 'Network error. Attendance NOT marked.');
       } finally {
         setIsValidating(false);
-        setTimeout(() => {
-          processingRef.current = false;
-        }, 1800);
       }
     },
-    [selectedClass, selectedSection, attendanceDate, onScanSuccess, showToast]
+    [selectedClass, selectedSection, attendanceDate, onScanSuccess, showToast, isStopped]
   );
 
-  const startScanner = useCallback(
-    async (targetCameraId?: string) => {
-      await stopScanner();
-
-      // Retry finding DOM element if modal is still animating mount
-      let element = document.getElementById('teacher-qr-reader');
-      let retries = 0;
-      while (!element && retries < 10) {
-        await new Promise((r) => setTimeout(r, 50));
-        element = document.getElementById('teacher-qr-reader');
-        retries++;
-      }
-
-      if (!element) {
-        console.warn('[CAMERA ERROR] #teacher-qr-reader DOM element not mounted.');
-        setScannerStatus('CAMERA_ERROR');
-        return;
-      }
-
-      setScannerStatus('REQUESTING_CAMERA');
-
-      try {
-        const html5Qrcode = new Html5Qrcode('teacher-qr-reader', false);
-        html5QrcodeRef.current = html5Qrcode;
-
-        let devices: CameraDevice[] = [];
-        try {
-          devices = await Html5Qrcode.getCameras();
-          if (devices && devices.length > 0) {
-            setAvailableCameras(devices);
-          }
-        } catch {
-          // Camera list query fallback
-        }
-
-        const scannerConfig = {
-          fps: 25,
-          qrbox: (w: number, h: number) => ({
-            width: Math.floor(w * 0.95),
-            height: Math.floor(h * 0.95),
-          }),
-          aspectRatio: 1.0,
-        };
-
-        const onScan = (decodedText: string) => {
-          handleProcessScan(decodedText);
-        };
-
-        const primaryConfig = targetCameraId
-          ? targetCameraId
-          : { facingMode: 'environment' };
-
-        try {
-          await html5Qrcode.start(primaryConfig, scannerConfig, onScan, () => {});
-        } catch (primaryErr) {
-          console.warn('[CAMERA FALLBACK 1] Environment camera failed. Trying user webcam...', primaryErr);
-          try {
-            await html5Qrcode.start({ facingMode: 'user' }, scannerConfig, onScan, () => {});
-          } catch (secondaryErr) {
-            console.warn('[CAMERA FALLBACK 2] Trying generic camera constraints...', secondaryErr);
-            try {
-              await html5Qrcode.start(true as any, scannerConfig, onScan, () => {});
-            } catch (tertiaryErr) {
-              if (devices && devices.length > 0) {
-                await html5Qrcode.start(devices[0].id, scannerConfig, onScan, () => {});
-              } else {
-                throw tertiaryErr;
-              }
-            }
-          }
-        }
-
-        setScannerStatus('SCANNING');
-      } catch (err: any) {
-        console.error('[HTML5QRCODE START ERROR]', err);
-        setScannerStatus('CAMERA_ERROR');
-      }
-    },
-    [selectedCameraId, stopScanner, handleProcessScan]
-  );
-
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    try {
-      const tempScanner = new Html5Qrcode('teacher-qr-reader', false);
-      const decodedText = await tempScanner.scanFile(file, true);
-      console.log('[UPLOADED QR RAW]', decodedText);
-      handleProcessScan(decodedText);
-    } catch {
-      showToast('error', 'Unable to read student QR code from uploaded image.');
-    } finally {
-      if (e.target) e.target.value = '';
-    }
+  const handleNextScan = () => {
+    setVerificationResult(null);
+    setLastScannedRaw(null);
+    setParsedStudentId(null);
+    isProcessingRef.current = false;
+    setIsPaused(false);
+    setIsStopped(false);
+    setStatusText('Camera ready — scan a student QR');
   };
 
-  const handleSwitchCamera = () => {
-    if (availableCameras.length <= 1) return;
-    const currentIndex = availableCameras.findIndex((c) => c.id === selectedCameraId);
-    const nextIndex = (currentIndex + 1) % availableCameras.length;
-    const nextCamId = availableCameras[nextIndex].id;
-    setSelectedCameraId(nextCamId);
-    startScanner(nextCamId);
+  const handleStopScanner = () => {
+    setIsStopped(true);
+    setIsPaused(true);
+    setStatusText('Camera unavailable');
   };
 
-  useEffect(() => {
-    if (isOpen && activeTab === 'CAMERA') {
-      const timer = setTimeout(() => {
-        startScanner();
-      }, 100);
-      return () => {
-        clearTimeout(timer);
-        stopScanner();
-      };
-    } else {
-      stopScanner();
-    }
-    return () => {
-      stopScanner();
-    };
-  }, [isOpen, activeTab, startScanner, stopScanner]);
+  const handleResumeScanner = () => {
+    setIsStopped(false);
+    setIsPaused(false);
+    isProcessingRef.current = false;
+    setStatusText('Camera ready — scan a student QR');
+  };
 
-  const renderVerificationCard = (res: StudentQRVerificationResult) => {
+  const renderStatusBadge = () => {
+    let colorClasses = 'bg-indigo-500/10 text-indigo-400 border-indigo-500/30';
+    if (statusText === 'Attendance marked successfully') colorClasses = 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40';
+    else if (statusText === 'Already marked') colorClasses = 'bg-blue-500/20 text-blue-300 border-blue-500/40';
+    else if (statusText === 'Validating student...' || statusText === 'Marking attendance...' || statusText === 'QR detected')
+      colorClasses = 'bg-amber-500/20 text-amber-300 border-amber-500/40';
+    else if (
+      statusText === 'Invalid student QR' ||
+      statusText === 'Student not found' ||
+      statusText === 'Student does not belong to selected class/section' ||
+      statusText === 'Camera permission denied' ||
+      statusText === 'Camera unavailable' ||
+      statusText === 'Network error'
+    )
+      colorClasses = 'bg-rose-500/20 text-rose-300 border-rose-500/40';
+
+    return (
+      <div className={`p-3 rounded-xl border text-xs font-semibold text-center transition-colors ${colorClasses}`}>
+        Live Status: <strong>{statusText}</strong>
+      </div>
+    );
+  };
+
+  const renderVerificationResultCard = (res: StudentQRVerificationResult) => {
     switch (res.status) {
       case 'PRESENT':
         return (
-          <div className="p-4 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-xl flex items-center gap-3">
+          <div className="p-4 bg-emerald-950/60 border border-emerald-800 rounded-xl flex items-center gap-3 text-emerald-200">
             <div className="w-10 h-10 rounded-full bg-emerald-500 text-white flex items-center justify-center font-bold shrink-0">
               <CheckCircle2 size={24} />
             </div>
             <div className="flex-1 text-left">
-              <span className="block text-xs font-bold text-emerald-800 dark:text-emerald-300">
-                ✓ Student Verified & Marked PRESENT
-              </span>
-              <span className="block text-sm font-black text-slate-800 dark:text-slate-100">
-                {res.student?.name}
-              </span>
-              <span className="block text-[10px] text-emerald-700 dark:text-emerald-400">
-                User ID: {res.student?.userId || res.student?.id} | Roll: {res.student?.rollNumber || 'CS-2026'} | Time:{' '}
-                {res.markedAt || 'Just now'}
+              <span className="block text-xs font-bold text-emerald-300">✓ Attendance Marked Successfully</span>
+              <span className="block text-sm font-black text-white">{res.student?.name}</span>
+              <span className="block text-[11px] text-emerald-400">
+                User ID: {res.student?.userId || res.student?.id} | Time: {res.markedAt || 'Just now'}
               </span>
             </div>
           </div>
@@ -298,55 +267,53 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
 
       case 'ALREADY_RECORDED':
         return (
-          <div className="p-4 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-xl flex items-center gap-3">
+          <div className="p-4 bg-blue-950/60 border border-blue-800 rounded-xl flex items-center gap-3 text-blue-200">
             <div className="w-10 h-10 rounded-full bg-blue-500 text-white flex items-center justify-center font-bold shrink-0">
               <UserCheck size={24} />
             </div>
             <div className="flex-1 text-left">
-              <span className="block text-xs font-bold text-blue-800 dark:text-blue-300">✓ Already Marked Present</span>
-              <span className="block text-sm font-black text-slate-800 dark:text-slate-100">{res.student?.name || 'Student'}</span>
-              <span className="block text-[10px] text-blue-700 dark:text-blue-400">
-                Attendance was already recorded for this session today.
-              </span>
+              <span className="block text-xs font-bold text-blue-300">Already Marked</span>
+              <span className="block text-sm font-black text-white">{res.student?.name || 'Student'}</span>
+              <span className="block text-[11px] text-blue-400">Attendance was already recorded for today's date.</span>
             </div>
           </div>
         );
 
       case 'WRONG_CLASS':
         return (
-          <div className="p-4 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-xl flex items-center gap-3">
+          <div className="p-4 bg-amber-950/60 border border-amber-800 rounded-xl flex items-center gap-3 text-amber-200">
             <div className="w-10 h-10 rounded-full bg-amber-500 text-white flex items-center justify-center font-bold shrink-0">
               <AlertTriangle size={24} />
             </div>
             <div className="flex-1 text-left">
-              <span className="block text-xs font-bold text-amber-800 dark:text-amber-300">Student Not In This Class!</span>
-              <span className="block text-xs text-amber-700 dark:text-amber-400">{res.message}</span>
+              <span className="block text-xs font-bold text-amber-300">Student Does Not Belong to Selected Class/Section</span>
+              <span className="block text-xs text-amber-400">{res.message}</span>
             </div>
           </div>
         );
 
       case 'UNAUTHORIZED':
         return (
-          <div className="p-4 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-xl flex items-center gap-3">
+          <div className="p-4 bg-rose-950/60 border border-rose-800 rounded-xl flex items-center gap-3 text-rose-200">
             <div className="w-10 h-10 rounded-full bg-rose-500 text-white flex items-center justify-center font-bold shrink-0">
               <ShieldAlert size={24} />
             </div>
             <div className="flex-1 text-left">
-              <span className="block text-xs font-bold text-rose-800 dark:text-rose-300">Cross-Tenant Access Denied!</span>
-              <span className="block text-xs text-rose-700 dark:text-rose-400">{res.message}</span>
+              <span className="block text-xs font-bold text-rose-300">Access Denied</span>
+              <span className="block text-xs text-rose-400">{res.message}</span>
             </div>
           </div>
         );
 
       default:
         return (
-          <div className="p-4 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-xl flex items-center gap-3">
+          <div className="p-4 bg-rose-950/60 border border-rose-800 rounded-xl flex items-center gap-3 text-rose-200">
             <div className="w-10 h-10 rounded-full bg-rose-500 text-white flex items-center justify-center font-bold shrink-0">
-              <XCircle size={24} />
+              {statusText === 'Network error' ? <WifiOff size={24} /> : <XCircle size={24} />}
             </div>
             <div className="flex-1 text-left">
-              <span className="block text-xs font-bold text-rose-800 dark:text-rose-300">Verification Failed</span>
-              <span className="block text-xs text-rose-700 dark:text-rose-400">{res.message}</span>
+              <span className="block text-xs font-bold text-rose-300">{statusText}</span>
+              <span className="block text-xs text-rose-400">{res.message}</span>
             </div>
           </div>
         );
@@ -357,153 +324,156 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title="Teacher QR Camera Scanner"
-      subtitle={`Scan students' personal QR codes for ${selectedClass} - Section ${selectedSection}`}
+      title="SCAN STUDENT QR"
+      subtitle={`Scanning student attendance for ${selectedClass} - Section ${selectedSection}`}
       maxWidth="md"
     >
-      <div className="space-y-4">
-        {/* Scanned Live Progress Bar */}
-        <div className="bg-slate-50 dark:bg-slate-800/80 p-3 rounded-xl border border-slate-200 dark:border-slate-700 flex justify-between items-center text-xs">
-          <span className="font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-1.5">
-            <Users size={14} className="text-indigo-500" />
-            Roster Scan Progress:
-          </span>
-          <span className="font-bold text-emerald-600 dark:text-emerald-400 text-sm">
-            {scannedCount} / {totalStudents} Scanned
-          </span>
-        </div>
+      <ErrorBoundary
+        fallbackTitle="Scanner Interface Error"
+        fallbackMessage="An unexpected error occurred in the scanner. Please retry."
+        onRetry={handleNextScan}
+      >
+        <div className="space-y-4">
+          {/* Progress Bar */}
+          <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700 flex justify-between items-center text-xs text-slate-200">
+            <span className="font-semibold flex items-center gap-1.5">
+              <Users size={14} className="text-indigo-400" />
+              Roster Scan Progress:
+            </span>
+            <span className="font-bold text-emerald-400 text-sm">
+              {scannedCount} / {totalStudents} Scanned
+            </span>
+          </div>
 
-        {/* Tab Toggle */}
-        <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
-          <button
-            className={`flex-1 py-1.5 text-xs font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors ${
-              activeTab === 'CAMERA' ? 'bg-white dark:bg-slate-700 shadow text-indigo-600 dark:text-indigo-400' : 'text-slate-500'
-            }`}
-            onClick={() => setActiveTab('CAMERA')}
-          >
-            <Camera size={14} /> Live Camera Scanner
-          </button>
-          <button
-            className={`flex-1 py-1.5 text-xs font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors ${
-              activeTab === 'MANUAL' ? 'bg-white dark:bg-slate-700 shadow text-indigo-600 dark:text-indigo-400' : 'text-slate-500'
-            }`}
-            onClick={() => setActiveTab('MANUAL')}
-          >
-            <KeyRound size={14} /> Enter User ID
-          </button>
-        </div>
+          {/* Mode Switcher */}
+          <div className="flex bg-slate-800 p-1 rounded-xl">
+            <button
+              className={`flex-1 py-1.5 text-xs font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors ${
+                activeTab === 'CAMERA' ? 'bg-slate-700 text-indigo-400 shadow' : 'text-slate-400'
+              }`}
+              onClick={() => setActiveTab('CAMERA')}
+            >
+              <Camera size={14} /> Live Camera Scanner
+            </button>
+            <button
+              className={`flex-1 py-1.5 text-xs font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors ${
+                activeTab === 'MANUAL' ? 'bg-slate-700 text-indigo-400 shadow' : 'text-slate-400'
+              }`}
+              onClick={() => setActiveTab('MANUAL')}
+            >
+              <KeyRound size={14} /> Enter Student ID
+            </button>
+          </div>
 
-        {/* Dynamic Verification Result Banner */}
-        {verificationResult && renderVerificationCard(verificationResult)}
+          {/* Live Status Indicator */}
+          {renderStatusBadge()}
 
-        {/* Viewport */}
-        {activeTab === 'CAMERA' ? (
-          <div className="space-y-3">
-            <div className="relative aspect-square max-h-[280px] w-full mx-auto bg-black rounded-2xl overflow-hidden border-2 border-indigo-500/30 flex items-center justify-center shadow-xl">
-              <div id="teacher-qr-reader" className="w-full h-full object-cover" />
+          {/* Verification Result Notification Card */}
+          {verificationResult && renderVerificationResultCard(verificationResult)}
 
-              {scannerStatus === 'CAMERA_ERROR' && (
-                <div className="absolute inset-0 bg-slate-900/90 text-white flex flex-col items-center justify-center p-4 text-center space-y-2">
-                  <AlertTriangle size={32} className="text-amber-400" />
-                  <p className="text-xs font-medium">Camera access unavailable or permission denied.</p>
-                  <Button size="sm" variant="outline" onClick={() => startScanner()}>
-                    <RefreshCw size={14} className="mr-1" /> Retry Camera
-                  </Button>
-                </div>
-              )}
-            </div>
-
-            {/* Camera Controls & File Upload Toolbar */}
-            <div className="flex items-center justify-between gap-2 pt-1">
-              <input
-                type="file"
-                ref={fileInputRef}
-                accept="image/*"
-                className="hidden"
-                onChange={handleFileUpload}
+          {/* Camera Viewport */}
+          {activeTab === 'CAMERA' ? (
+            <div className="space-y-3">
+              <ZXingQRScannerEngine
+                active={isOpen && activeTab === 'CAMERA' && !isStopped}
+                isPaused={isPaused}
+                onScan={handleProcessScan}
+                onStatusChange={(st) => {
+                  if (!isProcessingRef.current) {
+                    setStatusText(st as StatusDisplayText);
+                  }
+                }}
+                onError={(err) => {
+                  if (err.includes('permission')) setStatusText('Camera permission denied');
+                  else setStatusText('Camera unavailable');
+                }}
               />
-              <Button
-                size="sm"
-                variant="outline"
-                leftIcon={<Upload size={14} />}
-                onClick={() => fileInputRef.current?.click()}
-              >
-                Upload QR Image
-              </Button>
 
-              {availableCameras.length > 1 && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  leftIcon={<SwitchCamera size={14} />}
-                  onClick={handleSwitchCamera}
-                >
-                  Switch Camera ({availableCameras.length})
-                </Button>
-              )}
-            </div>
+              {/* Action Toolbar */}
+              <div className="flex items-center justify-between gap-2 pt-1">
+                {isPaused || isStopped ? (
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    leftIcon={<Play size={14} />}
+                    onClick={handleNextScan}
+                    className="flex-1 bg-emerald-600 hover:bg-emerald-500"
+                  >
+                    Scan Next Student
+                  </Button>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    leftIcon={<Square size={14} />}
+                    onClick={handleStopScanner}
+                    className="flex-1 text-slate-300 border-slate-700 hover:bg-slate-800"
+                  >
+                    Stop Scanner
+                  </Button>
+                )}
 
-            {/* Live Scan Debug Status Banner */}
-            {lastScannedRaw && (
-              <div className="p-2.5 bg-slate-900 border border-slate-800 rounded-xl text-[11px] font-mono text-slate-300 space-y-1">
-                <div className="flex justify-between items-center text-indigo-400 font-bold">
-                  <span>QR DETECTED & DECODED</span>
-                  <span>{new Date().toLocaleTimeString()}</span>
-                </div>
-                <div className="truncate">Payload: <span className="text-slate-200 font-semibold">{lastScannedRaw}</span></div>
-                {parsedUserId && (
-                  <div>Parsed Student User ID: <span className="text-emerald-400 font-bold">{parsedUserId}</span></div>
+                {isStopped && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    leftIcon={<RefreshCw size={14} />}
+                    onClick={handleResumeScanner}
+                    className="text-indigo-400 border-indigo-500/40"
+                  >
+                    Resume Scanner
+                  </Button>
                 )}
               </div>
-            )}
 
-            {/* Developer-Only Debug Panel */}
-            {import.meta.env.DEV && (
-              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl text-[11px] font-mono text-emerald-400 space-y-1">
-                <div className="flex justify-between items-center text-indigo-400 font-bold border-b border-slate-800 pb-1">
-                  <span>[DEV DEBUG PANEL]</span>
-                  <span>{scannerStatus}</span>
+              {/* Development Debug Mode Panel */}
+              {import.meta.env.DEV && (
+                <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl text-[11px] font-mono text-emerald-400 space-y-1">
+                  <div className="flex justify-between items-center text-indigo-400 font-bold border-b border-slate-800 pb-1">
+                    <span>[DEV DEBUG MODE]</span>
+                    <span>{statusText}</span>
+                  </div>
+                  <div className="truncate">Raw decoded value: <span className="text-slate-200">{lastScannedRaw || 'N/A'}</span></div>
+                  <div>Student ID: <span className="text-cyan-400 font-bold">{parsedStudentId || 'N/A'}</span></div>
+                  <div>Processing State: <span className="text-amber-300">{isProcessingRef.current ? 'LOCKED' : 'IDLE'}</span></div>
+                  <div>Session Set Count: <span className="text-purple-300">{scannedStudentsRef.current.size}</span></div>
                 </div>
-                <div className="truncate">QR Raw: <span className="text-slate-200">{lastScannedRaw || 'Waiting for scan...'}</span></div>
-                <div>Extracted User ID: <span className="text-cyan-400 font-bold">{parsedUserId || 'N/A'}</span></div>
-                <div>Matched Student: <span className="text-emerald-300 font-bold">{verificationResult?.student?.name || (isValidating ? 'Searching database...' : 'None')}</span></div>
-                <div>Attendance Status: <span className="text-amber-300">{verificationResult?.status || 'IDLE'}</span></div>
-              </div>
-            )}
-          </div>
-        ) : (
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleProcessScan(manualInput);
-            }}
-            className="space-y-3 py-2"
-          >
-            <Input
-              label="Student User ID or Email"
-              placeholder="e.g. student-001 or rahul@school.edu"
-              value={manualInput}
-              onChange={(e) => setManualInput(e.target.value)}
-              required
-            />
-            <Button
-              type="submit"
-              variant="primary"
-              className="w-full"
-              isLoading={isValidating}
-              leftIcon={<CheckCircle2 size={16} />}
+              )}
+            </div>
+          ) : (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleProcessScan(manualInput);
+              }}
+              className="space-y-3 py-2"
             >
-              TEST ATTENDANCE WITH STUDENT ID
-            </Button>
-          </form>
-        )}
+              <Input
+                label="Student User ID or Email"
+                placeholder="e.g. STU001 or rahul@school.edu"
+                value={manualInput}
+                onChange={(e) => setManualInput(e.target.value)}
+                required
+              />
+              <Button
+                type="submit"
+                variant="primary"
+                className="w-full"
+                isLoading={isValidating}
+                leftIcon={<CheckCircle2 size={16} />}
+              >
+                Submit Student ID
+              </Button>
+            </form>
+          )}
 
-        <div className="flex justify-end pt-2 border-t border-slate-100 dark:border-slate-800">
-          <Button variant="outline" onClick={onClose}>
-            Done Scanning
-          </Button>
+          <div className="flex justify-end pt-2 border-t border-slate-800">
+            <Button variant="outline" onClick={onClose}>
+              Done Scanning
+            </Button>
+          </div>
         </div>
-      </div>
+      </ErrorBoundary>
     </Modal>
   );
 };
