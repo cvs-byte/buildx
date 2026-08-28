@@ -119,7 +119,9 @@ export const QRGeneratorModal: React.FC<QRGeneratorModalProps> = ({
 
   const handleCopyToken = () => {
     if (qrToken) {
-      navigator.clipboard.writeText(qrToken);
+      if (navigator?.clipboard?.writeText) {
+        navigator.clipboard.writeText(qrToken).catch(() => {});
+      }
       showToast('success', 'QR Token copied to clipboard.');
     }
   };

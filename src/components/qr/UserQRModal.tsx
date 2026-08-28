@@ -41,7 +41,9 @@ export const UserQRModal: React.FC<UserQRModalProps> = ({
 
   const handleCopyUserId = () => {
     if (!userId) return;
-    navigator.clipboard.writeText(String(userId));
+    if (navigator?.clipboard?.writeText) {
+      navigator.clipboard.writeText(String(userId)).catch(() => {});
+    }
     showToast('success', `Copied User ID (${userId}) to clipboard.`);
   };
 

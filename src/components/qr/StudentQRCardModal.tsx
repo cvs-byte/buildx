@@ -34,7 +34,9 @@ export const StudentQRCardModal: React.FC<StudentQRCardModalProps> = ({
   });
 
   const handleCopyUserId = () => {
-    navigator.clipboard.writeText(studentId);
+    if (navigator?.clipboard?.writeText) {
+      navigator.clipboard.writeText(studentId).catch(() => {});
+    }
     showToast('success', `User ID (${studentId}) copied to clipboard.`);
   };
 

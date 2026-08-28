@@ -52,7 +52,9 @@ export const UserDetailDrawer: React.FC<UserDetailDrawerProps> = ({
   });
 
   const handleCopyUserId = () => {
-    navigator.clipboard.writeText(String(userId));
+    if (navigator?.clipboard?.writeText) {
+      navigator.clipboard.writeText(String(userId)).catch(() => {});
+    }
     showToast('success', `Copied User ID (${userId}) to clipboard.`);
   };
 
