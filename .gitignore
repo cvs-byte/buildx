@@ -7,24 +7,13 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-<<<<<<< HEAD
-node_modules
-dist
-dist-ssr
-*.local
-=======
-# Node dependencies
 node_modules/
-
-# Production build outputs
 dist/
 dist-ssr/
-
-# Environment variables and secrets
+*.local
 .env
 .env.*
 !.env.example
->>>>>>> 92dca00f69fc82875f648e889ae1075c4df64d30
 
 # Editor directories and files
 .vscode/*
