@@ -25,7 +25,7 @@ export function normalizeClassIds(classIds: any): string[] {
 
 /**
  * Checks whether a student entity belongs to a target selected class.
- * Compares selectedClass (e.g. "Class 10", "class-10", "class 10") against student.classIds.
+ * Compares selectedClass (e.g. "Class 10", "class-10", "10") against student.classIds / student.gradeLevel.
  */
 export function studentBelongsToClass(student: any, selectedClass: string): boolean {
   if (!selectedClass || !student) return false;
@@ -38,7 +38,8 @@ export function studentBelongsToClass(student: any, selectedClass: string): bool
     if (student.gradeLevel) rawClassIds.push(String(student.gradeLevel).trim().toLowerCase());
   }
 
-  if (rawClassIds.length === 0) return false;
+  // If student has no class defined, allow verification if in same institution
+  if (rawClassIds.length === 0) return true;
 
   const targetRaw = String(selectedClass).trim().toLowerCase();
   const targetClean = targetRaw.replace(/[-_]/g, ' ').replace(/\s+/g, ' '); // "class 10"
@@ -60,4 +61,34 @@ export function studentBelongsToClass(student: any, selectedClass: string): bool
 
     return false;
   });
+}
+
+/**
+ * Checks whether a student entity belongs to a target selected section.
+ * Compares selectedSection (e.g. "A", "Section A", "sec-a") against student.section / student.department.
+ */
+export function studentBelongsToSection(student: any, selectedSection: string): boolean {
+  if (!selectedSection || !student) return true;
+
+  const studentSec = student.section || student.department || student.sectionId;
+  if (!studentSec || String(studentSec).trim() === '') {
+    // If student record does not specify a section, do not block
+    return true;
+  }
+
+  const cleanTarget = String(selectedSection)
+    .toLowerCase()
+    .replace(/^sec(tion)?[-_\s]*/i, '')
+    .trim();
+
+  const cleanStudentSec = String(studentSec)
+    .toLowerCase()
+    .replace(/^sec(tion)?[-_\s]*/i, '')
+    .trim();
+
+  if (cleanTarget === cleanStudentSec) {
+    return true;
+  }
+
+  return cleanTarget === '' || cleanStudentSec === '';
 }

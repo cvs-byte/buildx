@@ -1,8 +1,8 @@
 import { apiClient } from './client';
 import { storage } from '../utils/storage';
 import { userApi } from './user.api';
-import { parseStudentQR } from '../utils/qrParser';
-import { normalizeClassIds, studentBelongsToClass } from '../utils/classUtils';
+import { parseStudentQR, extractEmailFromQR, isValidEmail } from '../utils/qrParser';
+import { studentBelongsToClass, studentBelongsToSection } from '../utils/classUtils';
 import type { AttendanceRecord } from '../types/dashboard.types';
 import type { PaginatedResponse } from '../types/api.types';
 import type { User } from '../types/user.types';
@@ -71,10 +71,22 @@ function normalizeAttendanceRecord(raw: any, defaultDate: string): AttendanceRec
 
 export const attendanceApi = {
   /**
-   * 1. Validate Teacher Scanning Student QR Code
-   * Parses student `userId` from QR, resolves user against real `Users` API (`https://api.academygrowth.in/Users`),
-   * verifies tenant context, posts attendance to backend (`PUT /attendance` or `POST /attendance/bulk`),
-   * and WAITS for backend HTTP response confirmation before returning verification result.
+   * Production Student QR Scan Validation Pipeline:
+   * QR (Decodes Email)
+   * ↓
+   * Validate Email Format
+   * ↓
+   * GET /Users -> findUserByEmail(email)
+   * ↓
+   * Extract Canonical User ID
+   * ↓
+   * Validate Student Account & Status
+   * ↓
+   * Validate Class & Section
+   * ↓
+   * Call Backend Attendance API with Canonical User ID
+   * ↓
+   * Confirm Backend Response -> Return Result
    */
   async validateStudentQRScan(params: {
     rawQR: string;
@@ -82,72 +94,61 @@ export const attendanceApi = {
     selectedSection: string;
     date?: string;
   }): Promise<StudentQRVerificationResult> {
-    console.log("========== QR DETECTED ==========");
-    console.log("[QR RAW]", params.rawQR);
+    console.log('========== QR SCAN INITIATED ==========');
+    console.log('[QR RAW INPUT]:', params.rawQR);
 
     const activeTenantId = storage.getSchoolId() || 'sch-001';
     const currentDate = params.date || new Date().toISOString().split('T')[0];
-    const parsedQR = parseStudentQR(params.rawQR);
 
-    console.log("[QR PARSED]", parsedQR);
+    // 1. Decode & validate email from QR
+    const email = extractEmailFromQR(params.rawQR);
+    console.log('[QR DECODED EMAIL]:', email);
 
-    if (!parsedQR || !parsedQR.userId) {
-      console.warn("[QR SCAN ERROR] Unable to parse student User ID from QR code:", params.rawQR);
+    if (!email || !isValidEmail(email)) {
+      console.warn('[QR SCAN REJECTED] Not a valid student email:', params.rawQR);
       return {
         success: false,
         status: 'INVALID_TOKEN',
-        message: 'Invalid QR code. Unable to parse student User ID.',
+        message: 'INVALID QR\nThis QR does not contain a valid student email.',
       };
     }
 
-    const scannedUserId = parsedQR.userId;
-    console.log("[STUDENT LOOKUP ID]", scannedUserId);
-
-    // Load real users directly from canonical Users API: https://api.academygrowth.in/Users
-    let allUsers: User[] = [];
+    // 2. Lookup student by email in canonical Users API (GET /Users)
+    let student: User | null = null;
     try {
-      allUsers = await userApi.getAllUsers();
-    } catch {
-      try {
-        allUsers = activeTenantId
-          ? await userApi.getUsersBySchool(activeTenantId)
-          : [];
-      } catch {
-        allUsers = [];
-      }
+      student = await userApi.findUserByEmail(email);
+    } catch (err: any) {
+      console.error('[USERS API LOOKUP ERROR]:', err);
+      return {
+        success: false,
+        status: 'INVALID_TOKEN',
+        message: `Error connecting to Users database: ${err.message || 'Network error'}`,
+      };
     }
 
-    const cleanScannedId = String(scannedUserId).trim().toLowerCase();
-
-    // Fast multi-field student lookup in real users database
-    let student = allUsers.find((u) => {
-      const uid = String(u.userId || u.id || '').trim().toLowerCase();
-      const roll = String(u.rollNumber || '').trim().toLowerCase();
-      const em = String(u.email || '').trim().toLowerCase();
-      return (
-        uid === cleanScannedId ||
-        roll === cleanScannedId ||
-        em === cleanScannedId ||
-        (cleanScannedId.length >= 3 && uid.includes(cleanScannedId)) ||
-        (cleanScannedId.length >= 3 && cleanScannedId.includes(uid))
-      );
-    });
-
-    console.log("[STUDENT LOOKUP RESULT]", student);
-
     if (!student) {
-      console.warn(`[STUDENT LOOKUP FAILED] Student "${scannedUserId}" not found in database.`);
+      console.warn(`[STUDENT LOOKUP FAILED] No user found for email: ${email}`);
       return {
         success: false,
         status: 'USER_NOT_FOUND',
-        message: `Student with User ID "${scannedUserId}" was not found in database https://api.academygrowth.in/Users.`,
+        message: 'STUDENT NOT FOUND\nNo registered student matches this QR.',
       };
     }
 
-    // Role validation
+    // 3. Extract canonical User ID
+    const canonicalUserId = student.userId || student.id;
+    console.log('[STUDENT MATCHED]:', {
+      name: student.name,
+      userId: canonicalUserId,
+      email: student.email,
+      role: student.role,
+      status: student.status,
+    });
+
+    // 4. Role validation
     const isStudentRole = String(student.role || '').toUpperCase() === 'STUDENT';
     if (!isStudentRole) {
-      console.warn(`[ROLE CHECK FAILED] User "${student.name}" has non-student role "${student.role}".`);
+      console.warn(`[ROLE CHECK FAILED] User "${student.name}" has role "${student.role}"`);
       return {
         success: false,
         status: 'UNAUTHORIZED',
@@ -156,10 +157,10 @@ export const attendanceApi = {
       };
     }
 
-    // Active status validation
+    // 5. Active status validation
     const isActiveStatus = String(student.status || 'ACTIVE').toUpperCase() === 'ACTIVE';
     if (!isActiveStatus) {
-      console.warn(`[STATUS CHECK FAILED] Student account "${student.name}" is inactive.`);
+      console.warn(`[STATUS CHECK FAILED] Student "${student.name}" is inactive.`);
       return {
         success: false,
         status: 'UNAUTHORIZED',
@@ -168,54 +169,58 @@ export const attendanceApi = {
       };
     }
 
-    // Multi-Tenant Isolation Check
+    // 6. Multi-Tenant Check
     const studentTenantId = student.schoolId || student.tenantId;
     if (activeTenantId && studentTenantId && activeTenantId !== studentTenantId) {
-      console.warn(`[TENANT CHECK FAILED] Student tenant "${studentTenantId}" differs from active tenant "${activeTenantId}".`);
+      console.warn(`[TENANT CHECK FAILED] Student school "${studentTenantId}" differs from "${activeTenantId}"`);
       return {
         success: false,
         status: 'UNAUTHORIZED',
-        message: `Cross-Tenant Access Denied! Student "${student.name}" belongs to another school (${student.schoolName || studentTenantId}).`,
+        message: `Cross-Tenant Access Denied! Student belongs to ${student.schoolName || studentTenantId}.`,
         student,
       };
     }
 
-    console.log("[SELECTED CLASS]", params.selectedClass);
-    console.log("[SELECTED SECTION]", params.selectedSection);
-    console.log("[STUDENT CLASS]", student.classIds || student.gradeLevel);
-    console.log("[STUDENT SECTION]", student.section);
-
-    // Class Membership Check
+    // 7. Class Membership Check
     if (params.selectedClass && !studentBelongsToClass(student, params.selectedClass)) {
-      console.warn(`[CLASS CHECK FAILED] Student "${student.name}" does not belong to selected class "${params.selectedClass}".`);
+      console.warn(`[CLASS CHECK FAILED] Student "${student.name}" does not belong to class "${params.selectedClass}"`);
       return {
         success: false,
         status: 'WRONG_CLASS',
-        message: `This student is not enrolled in the selected class (${params.selectedClass}).`,
+        message: `WRONG CLASS / SECTION\n${student.name}\nis not enrolled in the selected class (${params.selectedClass}).`,
         student,
       };
     }
 
-    const studentCanonicalId = student.userId || student.id;
+    // 8. Section Membership Check
+    if (params.selectedSection && !studentBelongsToSection(student, params.selectedSection)) {
+      console.warn(`[SECTION CHECK FAILED] Student "${student.name}" does not belong to section "${params.selectedSection}"`);
+      return {
+        success: false,
+        status: 'WRONG_CLASS',
+        message: `WRONG CLASS / SECTION\n${student.name}\nis not enrolled in Section ${params.selectedSection}.`,
+        student,
+      };
+    }
+
     const markedAtTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-    // Send Attendance Payload to Backend via POST to /attendance/bulk & Wait for HTTP response!
+    // 9. Send Attendance Request to Backend with canonical userId
     const bulkPayload = {
       date: currentDate,
       classId: params.selectedClass,
       sectionId: params.selectedSection,
       records: [
         {
-          studentId: studentCanonicalId,
+          studentId: canonicalUserId,
           status: 'PRESENT' as const,
-          remarks: 'Scanned Student Personal QR Pass',
+          remarks: 'Scanned Student QR Attendance Pass',
         },
       ],
     };
 
-    console.log("[ATTENDANCE REQUEST]", {
-      endpoint: '/attendance/bulk',
-      method: 'POST',
+    console.log('[ATTENDANCE API DISPATCH]', {
+      canonicalUserId,
       payload: bulkPayload,
     });
 
@@ -224,8 +229,8 @@ export const attendanceApi = {
       try {
         await this.submitBulkAttendance(bulkPayload);
         savedRecord = {
-          id: `att_${studentCanonicalId}_${currentDate}`,
-          userId: studentCanonicalId,
+          id: `att_${canonicalUserId}_${currentDate}`,
+          userId: canonicalUserId,
           userName: student.name,
           role: 'STUDENT',
           className: params.selectedClass,
@@ -233,55 +238,55 @@ export const attendanceApi = {
           date: currentDate,
           status: 'PRESENT',
           checkInTime: markedAtTime,
-          remarks: 'Scanned Student Personal QR Pass',
+          remarks: 'Scanned Student QR Attendance Pass',
         };
-        console.log("[ATTENDANCE RESPONSE]", { success: true, count: 1, record: savedRecord });
+        console.log('[ATTENDANCE API SUCCESS]', savedRecord);
       } catch (err: any) {
-        if (err?.status === 409 || err?.message?.includes('already')) {
-          console.warn("[ATTENDANCE RESPONSE 409]", `Attendance already recorded for ${student.name} today.`);
+        if (err?.status === 409 || err?.message?.toLowerCase().includes('already')) {
+          console.warn('[ATTENDANCE RECORDED 409]', `Attendance already recorded for ${student.name}`);
           return {
             success: false,
             status: 'ALREADY_RECORDED',
-            message: `Attendance already recorded for ${student.name} today.`,
+            message: `ALREADY MARKED\n${student.name}\nAttendance has already been recorded.`,
             student,
             markedAt: markedAtTime,
           };
         }
-        // Fallback to updateAttendance if bulk route is unavailable
+        // Fallback to updateAttendance contract
         savedRecord = await this.updateAttendance({
-          studentId: studentCanonicalId,
+          studentId: canonicalUserId,
           status: 'PRESENT',
           date: currentDate,
           classId: params.selectedClass,
           sectionId: params.selectedSection,
-          remarks: 'Scanned Student Personal QR Pass',
+          remarks: 'Scanned Student QR Attendance Pass',
         });
-        console.log("[ATTENDANCE RESPONSE FALLBACK]", savedRecord);
       }
 
       return {
         success: true,
         status: 'PRESENT',
-        message: `✓ Student Verified! ${student.name} marked PRESENT.`,
+        message: `✓ QR VERIFIED\n\nStudent: ${student.name}\nUser ID: ${canonicalUserId}\nEmail: ${student.email}`,
         student,
         markedAt: markedAtTime,
         record: savedRecord,
       };
     } catch (err: any) {
-      console.error("[ATTENDANCE RESPONSE ERROR]", err);
-      if (err?.status === 409 || err?.message?.includes('already')) {
+      console.error('[ATTENDANCE BACKEND ERROR]', err);
+      if (err?.status === 409 || err?.message?.toLowerCase().includes('already')) {
         return {
           success: false,
           status: 'ALREADY_RECORDED',
-          message: `Attendance already recorded for ${student.name} today.`,
+          message: `ALREADY MARKED\n${student.name}\nAttendance has already been recorded.`,
           student,
+          markedAt: markedAtTime,
         };
       }
 
       return {
         success: false,
         status: 'INVALID_TOKEN',
-        message: err.message || 'Attendance could not be saved. Please try again.',
+        message: `Attendance was NOT marked.\n${err.message || 'Server error'}`,
         student,
       };
     }

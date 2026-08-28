@@ -32,9 +32,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
-
       - name: Build Application Bundle
         run: npm run build
         env:

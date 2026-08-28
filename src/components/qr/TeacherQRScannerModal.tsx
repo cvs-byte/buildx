@@ -6,7 +6,6 @@ import { ErrorBoundary } from '../common/ErrorBoundary';
 import { ZXingQRScannerEngine } from './ZXingQRScannerEngine';
 import { attendanceApi } from '../../api/attendance.api';
 import { useToast } from '../../hooks/useToast';
-import { parseStudentQR } from '../../utils/qrParser';
 import type { StudentQRVerificationResult } from '../../types/attendance.types';
 import {
   Camera,
@@ -21,6 +20,8 @@ import {
   Square,
   WifiOff,
   RefreshCw,
+  Mail,
+  User as UserIcon,
 } from 'lucide-react';
 
 export interface TeacherQRScannerModalProps {
@@ -40,11 +41,11 @@ export type StatusDisplayText =
   | 'QR detected'
   | 'Validating student...'
   | 'Marking attendance...'
-  | 'Attendance marked successfully'
-  | 'Already marked'
-  | 'Invalid student QR'
-  | 'Student not found'
-  | 'Student does not belong to selected class/section'
+  | '✓ QR VERIFIED'
+  | 'ALREADY MARKED'
+  | 'INVALID QR'
+  | 'STUDENT NOT FOUND'
+  | 'WRONG CLASS / SECTION'
   | 'Camera permission denied'
   | 'Camera unavailable'
   | 'Network error';
@@ -69,10 +70,7 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const [isStopped, setIsStopped] = useState<boolean>(false);
 
-  const [lastScannedRaw, setLastScannedRaw] = useState<string | null>(null);
-  const [parsedStudentId, setParsedStudentId] = useState<string | null>(null);
-
-  // Session duplicate protection
+  // Session duplicate protection using canonical userId
   const isProcessingRef = useRef<boolean>(false);
   const scannedStudentsRef = useRef<Set<string>>(new Set());
 
@@ -84,8 +82,6 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
       setIsPaused(false);
       setIsStopped(false);
       setVerificationResult(null);
-      setLastScannedRaw(null);
-      setParsedStudentId(null);
       setStatusText('Initializing camera...');
     }
   }, [isOpen]);
@@ -101,57 +97,10 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
       setVerificationResult(null);
       setStatusText('QR detected');
 
-      // Section 12 & Section 25 REQUIRED DEBUG LOG: [QR RAW]
       console.log('[QR RAW]', JSON.stringify(rawDecodedText.trim()));
       console.log('[QR] Raw decoded value:', rawDecodedText.trim());
-      setLastScannedRaw(rawDecodedText.trim());
-
-      // Parse payload using centralized parser
-      const qrData = parseStudentQR(rawDecodedText.trim());
-      console.log('[QR] Parsed data:', qrData);
-
-      if (!qrData || !qrData.studentId) {
-        setStatusText('Invalid student QR');
-        showToast('error', 'Invalid student QR code format.');
-        setIsValidating(false);
-        setTimeout(() => {
-          isProcessingRef.current = false;
-        }, 1500);
-        return;
-      }
-
-      const studentId = qrData.studentId;
-      console.log('[QR] Student ID:', studentId);
-      setParsedStudentId(studentId);
-
-      // Section 14: Duplicate Scan Protection for session
-      if (scannedStudentsRef.current.has(studentId)) {
-        setStatusText('Already marked');
-        showToast('warning', `Student (${studentId}) already scanned in this session.`);
-        setVerificationResult({
-          success: false,
-          status: 'ALREADY_RECORDED',
-          message: 'Already marked in this scan session.',
-        });
-        setIsValidating(false);
-        setTimeout(() => {
-          isProcessingRef.current = false;
-        }, 1500);
-        return;
-      }
 
       setStatusText('Validating student...');
-
-      const payload = {
-        studentId,
-        classId: selectedClass,
-        sectionId: selectedSection,
-        date: attendanceDate || new Date().toISOString().split('T')[0],
-        status: 'PRESENT',
-      };
-
-      console.log('[ATTENDANCE] Request:', payload);
-      setStatusText('Marking attendance...');
 
       try {
         const response = await attendanceApi.validateStudentQRScan({
@@ -161,26 +110,35 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
           date: attendanceDate,
         });
 
-        console.log('[ATTENDANCE] Response:', response);
+        console.log('[ATTENDANCE VERIFICATION RESULT]', response);
         setVerificationResult(response);
 
         if (response.success && response.status === 'PRESENT') {
-          scannedStudentsRef.current.add(studentId);
-          setStatusText('Attendance marked successfully');
-          showToast('success', `✓ Attendance marked successfully for ${response.student?.name || studentId}`);
+          const canonicalUserId = response.student?.userId || response.student?.id || '';
+          if (canonicalUserId) {
+            scannedStudentsRef.current.add(canonicalUserId);
+          }
+          setStatusText('✓ QR VERIFIED');
+          showToast('success', `✓ QR Verified! ${response.student?.name || 'Student'} marked PRESENT.`);
           if (onScanSuccess) onScanSuccess(response);
         } else if (response.status === 'ALREADY_RECORDED') {
-          scannedStudentsRef.current.add(studentId);
-          setStatusText('Already marked');
+          const canonicalUserId = response.student?.userId || response.student?.id || '';
+          if (canonicalUserId) {
+            scannedStudentsRef.current.add(canonicalUserId);
+          }
+          setStatusText('ALREADY MARKED');
           showToast('info', response.message || 'Already marked');
         } else if (response.status === 'WRONG_CLASS') {
-          setStatusText('Student does not belong to selected class/section');
+          setStatusText('WRONG CLASS / SECTION');
           showToast('error', response.message);
         } else if (response.status === 'USER_NOT_FOUND') {
-          setStatusText('Student not found');
+          setStatusText('STUDENT NOT FOUND');
           showToast('error', response.message);
+        } else if (response.status === 'INVALID_TOKEN') {
+          setStatusText('INVALID QR');
+          showToast('error', response.message || 'INVALID QR: This QR does not contain a valid student email.');
         } else {
-          setStatusText('Invalid student QR');
+          setStatusText('INVALID QR');
           showToast('error', response.message || 'Invalid student QR');
         }
       } catch (err: any) {
@@ -189,11 +147,13 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
         setVerificationResult({
           success: false,
           status: 'INVALID_TOKEN',
-          message: err?.message || 'Unable to connect to attendance server. Scan was not marked. Please try again.',
+          message: err?.message || 'Attendance was NOT marked. Unable to connect to attendance server. Please try again.',
         });
-        showToast('error', 'Network error. Attendance NOT marked.');
+        showToast('error', 'Attendance was NOT marked. Network error.');
       } finally {
         setIsValidating(false);
+        // Note: isProcessingRef remains true while paused on result card,
+        // it resets to false when user clicks "Scan Next Student" or resumes scanner
       }
     },
     [selectedClass, selectedSection, attendanceDate, onScanSuccess, showToast, isStopped]
@@ -201,8 +161,6 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
 
   const handleNextScan = () => {
     setVerificationResult(null);
-    setLastScannedRaw(null);
-    setParsedStudentId(null);
     isProcessingRef.current = false;
     setIsPaused(false);
     setIsStopped(false);
@@ -224,14 +182,14 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
 
   const renderStatusBadge = () => {
     let colorClasses = 'bg-indigo-500/10 text-indigo-400 border-indigo-500/30';
-    if (statusText === 'Attendance marked successfully') colorClasses = 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40';
-    else if (statusText === 'Already marked') colorClasses = 'bg-blue-500/20 text-blue-300 border-blue-500/40';
+    if (statusText === '✓ QR VERIFIED') colorClasses = 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40';
+    else if (statusText === 'ALREADY MARKED') colorClasses = 'bg-blue-500/20 text-blue-300 border-blue-500/40';
     else if (statusText === 'Validating student...' || statusText === 'Marking attendance...' || statusText === 'QR detected')
       colorClasses = 'bg-amber-500/20 text-amber-300 border-amber-500/40';
     else if (
-      statusText === 'Invalid student QR' ||
-      statusText === 'Student not found' ||
-      statusText === 'Student does not belong to selected class/section' ||
+      statusText === 'INVALID QR' ||
+      statusText === 'STUDENT NOT FOUND' ||
+      statusText === 'WRONG CLASS / SECTION' ||
       statusText === 'Camera permission denied' ||
       statusText === 'Camera unavailable' ||
       statusText === 'Network error'
@@ -240,7 +198,7 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
 
     return (
       <div className={`p-3 rounded-xl border text-xs font-semibold text-center transition-colors ${colorClasses}`}>
-        Live Status: <strong>{statusText}</strong>
+        Status: <strong>{statusText}</strong>
       </div>
     );
   };
@@ -249,69 +207,96 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
     switch (res.status) {
       case 'PRESENT':
         return (
-          <div className="p-4 bg-emerald-950/60 border border-emerald-800 rounded-xl flex items-center gap-3 text-emerald-200">
-            <div className="w-10 h-10 rounded-full bg-emerald-500 text-white flex items-center justify-center font-bold shrink-0">
-              <CheckCircle2 size={24} />
+          <div className="p-4 bg-emerald-950/70 border border-emerald-700 rounded-2xl space-y-3 text-emerald-100 shadow-xl">
+            <div className="flex items-center gap-3 border-b border-emerald-800/60 pb-3">
+              <div className="w-10 h-10 rounded-full bg-emerald-500 text-white flex items-center justify-center font-bold shrink-0 shadow-lg">
+                <CheckCircle2 size={24} />
+              </div>
+              <div className="flex-1 text-left">
+                <span className="block text-xs font-black tracking-wider text-emerald-300 uppercase">✓ QR VERIFIED</span>
+                <span className="block text-base font-black text-white">{res.student?.name}</span>
+              </div>
             </div>
-            <div className="flex-1 text-left">
-              <span className="block text-xs font-bold text-emerald-300">✓ Attendance Marked Successfully</span>
-              <span className="block text-sm font-black text-white">{res.student?.name}</span>
-              <span className="block text-[11px] text-emerald-400">
-                User ID: {res.student?.userId || res.student?.id} | Time: {res.markedAt || 'Just now'}
-              </span>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono bg-slate-900/80 p-3 rounded-xl border border-emerald-900">
+              <div className="flex items-center gap-1.5 text-slate-200">
+                <UserIcon size={14} className="text-emerald-400" />
+                <span>User ID: <strong>{res.student?.userId || res.student?.id}</strong></span>
+              </div>
+              <div className="flex items-center gap-1.5 text-slate-200 truncate">
+                <Mail size={14} className="text-emerald-400" />
+                <span className="truncate">Email: <strong>{res.student?.email}</strong></span>
+              </div>
+              <div className="text-[11px] text-emerald-400 col-span-full pt-1">
+                Class: {selectedClass} - Section {selectedSection} | Time: {res.markedAt || 'Just now'}
+              </div>
             </div>
           </div>
         );
 
       case 'ALREADY_RECORDED':
         return (
-          <div className="p-4 bg-blue-950/60 border border-blue-800 rounded-xl flex items-center gap-3 text-blue-200">
-            <div className="w-10 h-10 rounded-full bg-blue-500 text-white flex items-center justify-center font-bold shrink-0">
+          <div className="p-4 bg-blue-950/70 border border-blue-700 rounded-2xl flex items-center gap-3 text-blue-100 shadow-xl">
+            <div className="w-10 h-10 rounded-full bg-blue-500 text-white flex items-center justify-center font-bold shrink-0 shadow-lg">
               <UserCheck size={24} />
             </div>
             <div className="flex-1 text-left">
-              <span className="block text-xs font-bold text-blue-300">Already Marked</span>
-              <span className="block text-sm font-black text-white">{res.student?.name || 'Student'}</span>
-              <span className="block text-[11px] text-blue-400">Attendance was already recorded for today's date.</span>
+              <span className="block text-xs font-black tracking-wider text-blue-300 uppercase">ALREADY MARKED</span>
+              <span className="block text-sm font-bold text-white">{res.student?.name || 'Student'}</span>
+              <span className="block text-xs text-blue-300">Attendance has already been recorded.</span>
             </div>
           </div>
         );
 
       case 'WRONG_CLASS':
         return (
-          <div className="p-4 bg-amber-950/60 border border-amber-800 rounded-xl flex items-center gap-3 text-amber-200">
-            <div className="w-10 h-10 rounded-full bg-amber-500 text-white flex items-center justify-center font-bold shrink-0">
+          <div className="p-4 bg-amber-950/70 border border-amber-700 rounded-2xl flex items-center gap-3 text-amber-100 shadow-xl">
+            <div className="w-10 h-10 rounded-full bg-amber-500 text-white flex items-center justify-center font-bold shrink-0 shadow-lg">
               <AlertTriangle size={24} />
             </div>
             <div className="flex-1 text-left">
-              <span className="block text-xs font-bold text-amber-300">Student Does Not Belong to Selected Class/Section</span>
-              <span className="block text-xs text-amber-400">{res.message}</span>
+              <span className="block text-xs font-black tracking-wider text-amber-300 uppercase">WRONG CLASS / SECTION</span>
+              <span className="block text-xs text-amber-200 whitespace-pre-line">{res.message}</span>
+            </div>
+          </div>
+        );
+
+      case 'USER_NOT_FOUND':
+        return (
+          <div className="p-4 bg-rose-950/70 border border-rose-700 rounded-2xl flex items-center gap-3 text-rose-100 shadow-xl">
+            <div className="w-10 h-10 rounded-full bg-rose-500 text-white flex items-center justify-center font-bold shrink-0 shadow-lg">
+              <XCircle size={24} />
+            </div>
+            <div className="flex-1 text-left">
+              <span className="block text-xs font-black tracking-wider text-rose-300 uppercase">STUDENT NOT FOUND</span>
+              <span className="block text-xs text-rose-200">No registered student matches this QR.</span>
             </div>
           </div>
         );
 
       case 'UNAUTHORIZED':
         return (
-          <div className="p-4 bg-rose-950/60 border border-rose-800 rounded-xl flex items-center gap-3 text-rose-200">
-            <div className="w-10 h-10 rounded-full bg-rose-500 text-white flex items-center justify-center font-bold shrink-0">
+          <div className="p-4 bg-rose-950/70 border border-rose-700 rounded-2xl flex items-center gap-3 text-rose-100 shadow-xl">
+            <div className="w-10 h-10 rounded-full bg-rose-500 text-white flex items-center justify-center font-bold shrink-0 shadow-lg">
               <ShieldAlert size={24} />
             </div>
             <div className="flex-1 text-left">
-              <span className="block text-xs font-bold text-rose-300">Access Denied</span>
-              <span className="block text-xs text-rose-400">{res.message}</span>
+              <span className="block text-xs font-black tracking-wider text-rose-300 uppercase">ACCESS DENIED</span>
+              <span className="block text-xs text-rose-200">{res.message}</span>
             </div>
           </div>
         );
 
       default:
         return (
-          <div className="p-4 bg-rose-950/60 border border-rose-800 rounded-xl flex items-center gap-3 text-rose-200">
-            <div className="w-10 h-10 rounded-full bg-rose-500 text-white flex items-center justify-center font-bold shrink-0">
+          <div className="p-4 bg-rose-950/70 border border-rose-700 rounded-2xl flex items-center gap-3 text-rose-100 shadow-xl">
+            <div className="w-10 h-10 rounded-full bg-rose-500 text-white flex items-center justify-center font-bold shrink-0 shadow-lg">
               {statusText === 'Network error' ? <WifiOff size={24} /> : <XCircle size={24} />}
             </div>
             <div className="flex-1 text-left">
-              <span className="block text-xs font-bold text-rose-300">{statusText}</span>
-              <span className="block text-xs text-rose-400">{res.message}</span>
+              <span className="block text-xs font-black tracking-wider text-rose-300 uppercase">
+                {res.status === 'INVALID_TOKEN' ? 'INVALID QR' : statusText}
+              </span>
+              <span className="block text-xs text-rose-200 whitespace-pre-line">{res.message}</span>
             </div>
           </div>
         );
@@ -359,7 +344,7 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
               }`}
               onClick={() => setActiveTab('MANUAL')}
             >
-              <KeyRound size={14} /> Enter Student ID
+              <KeyRound size={14} /> Enter Student Email / ID
             </button>
           </div>
 
@@ -433,8 +418,8 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
               className="space-y-3 py-2"
             >
               <Input
-                label="Student User ID or Email"
-                placeholder="e.g. STU001 or rahul@school.edu"
+                label="Student Email Address"
+                placeholder="e.g. rahul@school.edu or student@example.com"
                 value={manualInput}
                 onChange={(e) => setManualInput(e.target.value)}
                 required
@@ -446,7 +431,7 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
                 isLoading={isValidating}
                 leftIcon={<CheckCircle2 size={16} />}
               >
-                Submit Student ID
+                Validate & Mark Attendance
               </Button>
             </form>
           )}
