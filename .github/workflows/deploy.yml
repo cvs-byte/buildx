@@ -30,6 +30,9 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
+
       - name: Build Application Bundle
         run: npm run build
         env:
@@ -40,9 +43,6 @@ jobs:
           VITE_COGNITO_LOGOUT_URI: https://academygrowth.in/login
           VITE_API_URL: https://academygrowth.in/api
           VITE_AWS_REGION: us-east-1
-
-      - name: Setup GitHub Pages
-        uses: actions/configure-pages@v5
 
       - name: Upload Build Artifact
         uses: actions/upload-pages-artifact@v3
