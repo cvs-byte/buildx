@@ -96,6 +96,93 @@ export function extractEmailFromQR(rawInput: string): string | null {
   return null;
 }
 
+export interface ParsedIdentifier {
+  /** The exact identifier value to look up, preserved as decoded (case-preserved for IDs). */
+  value: string;
+  type: 'email' | 'id';
+}
+
+/**
+ * Extracts a lookup identifier (email OR canonical student/user ID) from a raw QR scan string.
+ *
+ * IMPORTANT: the app's own QR generators (StudentQRCardModal, UserQRModal) encode JSON payloads
+ * such as { "studentId": "<userId>", "userId": "<userId>", ... } or { "v": 1, "type": "student",
+ * "studentId": "<userId>" } — the studentId/userId is the canonical user ID from the Users table,
+ * which is NOT guaranteed to be email-shaped. A strict "must look like an email" check (as used by
+ * extractEmailFromQR) rejects every QR code the app itself prints, so this function accepts a
+ * non-email ID candidate too, and preserves it exactly rather than mutating it. The Users API lookup
+ * (userApi.findUserByEmail) already matches by userId/rollNumber as a fallback, so returning an ID
+ * identifier here is sufficient to resolve the student.
+ */
+export function extractIdentifierFromQR(rawInput: string): ParsedIdentifier | null {
+  if (!rawInput || typeof rawInput !== 'string') {
+    return null;
+  }
+
+  const trimmed = rawInput.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  // 1. Direct plain email
+  if (isValidEmail(trimmed)) {
+    return { value: trimmed.toLowerCase(), type: 'email' };
+  }
+
+  // 2. JSON payload (object, or a JSON string wrapping an object)
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('"') && trimmed.endsWith('"'))) {
+    try {
+      let parsedObj: any = trimmed;
+      if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+        parsedObj = JSON.parse(trimmed);
+      }
+      if (typeof parsedObj === 'string' && parsedObj.startsWith('{')) {
+        parsedObj = JSON.parse(parsedObj);
+      }
+      if (typeof parsedObj === 'string') {
+        parsedObj = JSON.parse(parsedObj);
+      }
+
+      if (typeof parsedObj === 'object' && parsedObj !== null) {
+        // Prefer an explicit, well-formed email field when present.
+        const emailCandidate =
+          parsedObj.email || parsedObj.userEmail || parsedObj.studentEmail || parsedObj.emailAddress;
+        if (emailCandidate && typeof emailCandidate === 'string') {
+          const cleanEmail = emailCandidate.trim().toLowerCase();
+          if (isValidEmail(cleanEmail)) {
+            return { value: cleanEmail, type: 'email' };
+          }
+        }
+
+        // Otherwise fall back to the canonical student/user ID field, preserved exactly.
+        const idCandidate = parsedObj.studentId ?? parsedObj.userId ?? parsedObj.id;
+        if (idCandidate !== undefined && idCandidate !== null) {
+          const cleanId = String(idCandidate).trim();
+          if (cleanId) {
+            return isValidEmail(cleanId)
+              ? { value: cleanId.toLowerCase(), type: 'email' }
+              : { value: cleanId, type: 'id' };
+          }
+        }
+      }
+    } catch {
+      // Ignore JSON parse errors and fall through to the checks below.
+    }
+  }
+
+  // 3. Reject URLs / arbitrary web links — these are never valid student identifiers.
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.includes('/') || trimmed.includes('?')) {
+    return null;
+  }
+
+  // 4. Legacy bare alphanumeric ID QR (e.g. "STU001"), preserved exactly.
+  if (/^[a-zA-Z0-9_-]{3,64}$/.test(trimmed)) {
+    return { value: trimmed, type: 'id' };
+  }
+
+  return null;
+}
+
 /**
  * Master parser for student QR codes.
  * Returns ParsedStudentQR object if a valid student email can be decoded.

@@ -70,21 +70,25 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const [isStopped, setIsStopped] = useState<boolean>(false);
 
-  // Session duplicate protection using canonical userId
+  // Session duplicate protection: cache by raw scanned QR text so a repeat scan of the same
+  // physical QR code within this session resolves instantly without another network round-trip.
   const isProcessingRef = useRef<boolean>(false);
   const scannedStudentsRef = useRef<Set<string>>(new Set());
+  const lastResultByKeyRef = useRef<Map<string, StudentQRVerificationResult>>(new Map());
 
-  // Reset modal session state on open
+  // Reset modal session state on open, and whenever the attendance context (class/section/date)
+  // changes — a cached "already marked" result must never leak across a different class context.
   useEffect(() => {
     if (isOpen) {
       isProcessingRef.current = false;
       scannedStudentsRef.current.clear();
+      lastResultByKeyRef.current.clear();
       setIsPaused(false);
       setIsStopped(false);
       setVerificationResult(null);
       setStatusText('Initializing camera...');
     }
-  }, [isOpen]);
+  }, [isOpen, selectedClass, selectedSection, attendanceDate]);
 
   const handleProcessScan = useCallback(
     async (rawDecodedText: string) => {
@@ -102,6 +106,24 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
 
       setStatusText('Validating student...');
 
+      // Fast client-side duplicate check: if this exact QR text was already verified as
+      // PRESENT/ALREADY_RECORDED earlier in this session, skip the network round-trip and
+      // show the cached result instantly instead of hammering the backend with a repeat request.
+      const scanKey = rawDecodedText.trim();
+      if (scannedStudentsRef.current.has(scanKey)) {
+        const cached = lastResultByKeyRef.current.get(scanKey);
+        setVerificationResult(
+          cached || {
+            success: false,
+            status: 'ALREADY_RECORDED',
+            message: 'ALREADY MARKED\nThis QR has already been scanned this session.',
+          }
+        );
+        setStatusText('ALREADY MARKED');
+        setIsValidating(false);
+        return;
+      }
+
       try {
         const response = await attendanceApi.validateStudentQRScan({
           rawQR: rawDecodedText.trim(),
@@ -115,17 +137,17 @@ export const TeacherQRScannerModal: React.FC<TeacherQRScannerModalProps> = ({
 
         if (response.success && response.status === 'PRESENT') {
           const canonicalUserId = response.student?.userId || response.student?.id || '';
-          if (canonicalUserId) {
-            scannedStudentsRef.current.add(canonicalUserId);
-          }
+          scannedStudentsRef.current.add(scanKey);
+          if (canonicalUserId) scannedStudentsRef.current.add(canonicalUserId);
+          lastResultByKeyRef.current.set(scanKey, response);
           setStatusText('✓ QR VERIFIED');
           showToast('success', `✓ QR Verified! ${response.student?.name || 'Student'} marked PRESENT.`);
           if (onScanSuccess) onScanSuccess(response);
         } else if (response.status === 'ALREADY_RECORDED') {
           const canonicalUserId = response.student?.userId || response.student?.id || '';
-          if (canonicalUserId) {
-            scannedStudentsRef.current.add(canonicalUserId);
-          }
+          scannedStudentsRef.current.add(scanKey);
+          if (canonicalUserId) scannedStudentsRef.current.add(canonicalUserId);
+          lastResultByKeyRef.current.set(scanKey, response);
           setStatusText('ALREADY MARKED');
           showToast('info', response.message || 'Already marked');
         } else if (response.status === 'WRONG_CLASS') {

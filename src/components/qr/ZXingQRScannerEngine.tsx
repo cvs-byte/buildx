@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { BrowserQRCodeReader, BarcodeFormat, IScannerControls } from '@zxing/browser';
 import { DecodeHintType } from '@zxing/library';
 import jsQR from 'jsqr';
-import { Camera, AlertTriangle, SwitchCamera, ShieldAlert, Upload, RefreshCw, KeyRound, CheckCircle2, XCircle } from 'lucide-react';
+import { Camera, AlertTriangle, SwitchCamera, ShieldAlert, Upload, RefreshCw, KeyRound, CheckCircle2, XCircle, Zap, ZapOff } from 'lucide-react';
 import { Button } from '../common/Button';
 import { decodeQRFromImageFile, ImageQRDecodeResult } from '../../utils/qrImageDecoder';
 
@@ -32,12 +32,15 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const jsQRIntervalRef = useRef<number | null>(null);
+  const videoTrackRef = useRef<MediaStreamTrack | null>(null);
 
   const [availableDevices, setAvailableDevices] = useState<CameraDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isInitializing, setIsInitializing] = useState<boolean>(true);
   const [isSecure, setIsSecure] = useState<boolean>(true);
+  const [torchSupported, setTorchSupported] = useState<boolean>(false);
+  const [torchOn, setTorchOn] = useState<boolean>(false);
 
   // Section 21 Diagnostics State
   const [permissionState, setPermissionState] = useState<'UNKNOWN' | 'GRANTED' | 'DENIED'>('UNKNOWN');
@@ -106,6 +109,8 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
       mediaStreamRef.current = null;
     }
 
+    videoTrackRef.current = null;
+
     if (videoRef.current) {
       try {
         videoRef.current.srcObject = null;
@@ -116,6 +121,8 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
 
     setCameraState('STOPPED');
     setDecoderState('STOPPED');
+    setTorchSupported(false);
+    setTorchOn(false);
   }, []);
 
   const handleQRDetected = useCallback(
@@ -311,6 +318,18 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
       setCameraState('READY');
       console.log('Camera stream READY:', { readyState: videoElement.readyState, width, height });
 
+      // Section 13: Detect flashlight/torch capability on the active video track.
+      // Torch support varies by browser/device — gracefully hide the control when unsupported.
+      const activeTrack = activeStream.getVideoTracks()[0] || null;
+      videoTrackRef.current = activeTrack;
+      setTorchOn(false);
+      try {
+        const capabilities = (activeTrack?.getCapabilities?.() as (MediaTrackCapabilities & { torch?: boolean }) | undefined);
+        setTorchSupported(Boolean(capabilities && 'torch' in capabilities));
+      } catch {
+        setTorchSupported(false);
+      }
+
       // Section 9 & 17: START QR DECODER ONLY AFTER CAMERA IS READY
       const hints = new Map();
       hints.set(DecodeHintType.TRY_HARDER, true);
@@ -409,6 +428,20 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
     const nextDevice = availableDevices[nextIndex];
     setSelectedDeviceId(nextDevice.deviceId);
     startCameraScanner(nextDevice.deviceId);
+  };
+
+  // Section 13: Toggle flashlight/torch on the active camera track, when supported.
+  const handleToggleTorch = async () => {
+    const track = videoTrackRef.current;
+    if (!track || !torchSupported) return;
+    const nextTorchState = !torchOn;
+    try {
+      await track.applyConstraints({ advanced: [{ torch: nextTorchState } as any] });
+      setTorchOn(nextTorchState);
+    } catch (err) {
+      console.warn('[TORCH TOGGLE WARN] Device rejected torch constraint.', err);
+      setTorchSupported(false);
+    }
   };
 
   // Section 10 & 32: IMAGE DECODER TEST (Scan QR from Image)
@@ -514,11 +547,13 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
         )}
       </div>
 
-      {/* Section 21: Mandatory Camera & System Diagnostics Panel */}
+      {/* Dev-only diagnostics: never shown to teachers in production. Gated behind import.meta.env.DEV
+          so the production scanner stays a clean, professional camera view rather than a debug console. */}
+      {import.meta.env.DEV && (
       <div className="bg-slate-900 border border-slate-800 p-3 rounded-xl space-y-2 text-xs font-mono text-slate-300 text-left shadow-lg">
         <div className="flex justify-between items-center border-b border-slate-800 pb-1 text-[11px] font-bold text-indigo-400">
           <span>SYSTEM & CAMERA DIAGNOSTICS</span>
-          <span className="text-slate-500 font-normal">Section 21</span>
+          <span className="text-slate-500 font-normal">Dev only</span>
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-[11px]">
@@ -592,9 +627,10 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
           </div>
         </div>
       </div>
+      )}
 
-      {/* Standalone Raw Decoded Output Display Box (Section 3 & 31) */}
-      {rawDecodedText && (
+      {/* Standalone Raw Decoded Output Display Box — dev-only diagnostic (Section 3 & 31) */}
+      {import.meta.env.DEV && rawDecodedText && (
         <div className="p-3 bg-emerald-950/60 border border-emerald-800 rounded-xl text-left space-y-1 font-mono text-xs text-emerald-200 shadow-lg">
           <div className="flex justify-between items-center font-bold text-emerald-400">
             <span>✓ RAW QR DECODER OUTPUT</span>
@@ -606,12 +642,19 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
         </div>
       )}
 
-      {/* Section 7: Image Decoding Diagnostic Display Panel (Dev Mode & Diagnostic toolbar) */}
-      {imageDecodeInfo && (
+      {/* Image Decoder Result (Section 7). Production teachers get a short, friendly outcome;
+          the full attempt-by-attempt breakdown is a dev-only diagnostic. */}
+      {imageDecodeInfo && !imageDecodeInfo.success && (
+        <div className="p-3 bg-rose-950/70 border border-rose-700 rounded-xl flex items-center gap-2 text-rose-100 text-xs font-medium shadow-lg">
+          <XCircle size={16} className="text-rose-400 shrink-0" />
+          <span>Unable to read a QR code from that image. Try a clearer photo or use the live camera.</span>
+        </div>
+      )}
+      {import.meta.env.DEV && imageDecodeInfo && (
         <div className="p-3.5 bg-slate-900 border border-slate-700 rounded-xl space-y-2 font-mono text-xs text-slate-200 shadow-xl text-left">
           <div className="flex justify-between items-center font-bold text-indigo-400 border-b border-slate-800 pb-1.5">
             <span className="flex items-center gap-1.5">
-              <Upload size={14} className="text-cyan-400" /> IMAGE QR DECODER DIAGNOSTICS
+              <Upload size={14} className="text-cyan-400" /> IMAGE QR DECODER DIAGNOSTICS (DEV)
             </span>
             <span className={imageDecodeInfo.success ? 'text-emerald-400 font-bold flex items-center gap-1' : 'text-rose-400 font-bold flex items-center gap-1'}>
               {imageDecodeInfo.success ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
@@ -640,16 +683,10 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
               </div>
             </div>
           )}
-
-          {!imageDecodeInfo.success && (
-            <div className="pt-1 text-rose-400 font-bold text-center">
-              Unable to decode this QR image.
-            </div>
-          )}
         </div>
       )}
 
-      {/* Development Diagnostic Toolbar (Section 10 & 32) */}
+      {/* Camera Controls Toolbar (Section 13: Flashlight & Camera Switching) */}
       <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
         <input
           type="file"
@@ -664,21 +701,39 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
           leftIcon={<Upload size={14} />}
           onClick={() => fileInputRef.current?.click()}
           className="text-xs"
+          isLoading={isDecodingImage}
         >
           Scan QR from Image
         </Button>
 
-        {availableDevices.length > 1 && (
-          <Button
-            size="sm"
-            variant="outline"
-            leftIcon={<SwitchCamera size={14} />}
-            onClick={handleSwitchCamera}
-            className="text-xs"
-          >
-            Switch Camera ({availableDevices.length})
-          </Button>
-        )}
+        <div className="flex items-center gap-2">
+          {torchSupported && (
+            <Button
+              size="sm"
+              variant="outline"
+              leftIcon={torchOn ? <Zap size={14} className="text-amber-400" /> : <ZapOff size={14} />}
+              onClick={handleToggleTorch}
+              className="text-xs"
+              aria-pressed={torchOn}
+              aria-label={torchOn ? 'Turn off flashlight' : 'Turn on flashlight'}
+            >
+              {torchOn ? 'Flash On' : 'Flash'}
+            </Button>
+          )}
+
+          {availableDevices.length > 1 && (
+            <Button
+              size="sm"
+              variant="outline"
+              leftIcon={<SwitchCamera size={14} />}
+              onClick={handleSwitchCamera}
+              className="text-xs"
+              aria-label="Switch camera"
+            >
+              Switch Camera ({availableDevices.length})
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* Section 33: Manual QR Text Test Input */}
