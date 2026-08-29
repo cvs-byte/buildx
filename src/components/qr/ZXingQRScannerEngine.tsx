@@ -2,8 +2,9 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { BrowserQRCodeReader, BarcodeFormat, IScannerControls } from '@zxing/browser';
 import { DecodeHintType } from '@zxing/library';
 import jsQR from 'jsqr';
-import { Camera, AlertTriangle, SwitchCamera, ShieldAlert, Upload, RefreshCw, KeyRound } from 'lucide-react';
+import { Camera, AlertTriangle, SwitchCamera, ShieldAlert, Upload, RefreshCw, KeyRound, CheckCircle2, XCircle } from 'lucide-react';
 import { Button } from '../common/Button';
+import { decodeQRFromImageFile, ImageQRDecodeResult } from '../../utils/qrImageDecoder';
 
 export interface CameraDeviceInfo {
   deviceId: string;
@@ -44,6 +45,8 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
   const [videoDimensions, setVideoDimensions] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [cameraStateText, setCameraStateText] = useState<string>('Initializing');
   const [manualTestInput, setManualTestInput] = useState<string>('');
+  const [imageDecodeInfo, setImageDecodeInfo] = useState<ImageQRDecodeResult | null>(null);
+  const [isDecodingImage, setIsDecodingImage] = useState<boolean>(false);
 
   const detectedLockRef = useRef<boolean>(false);
 
@@ -320,49 +323,27 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
     const file = e.target.files?.[0];
     if (!file) return;
 
-    try {
-      if (!codeReaderRef.current) {
-        codeReaderRef.current = new BrowserQRCodeReader();
-      }
-      const imgUrl = URL.createObjectURL(file);
+    setIsDecodingImage(true);
+    setImageDecodeInfo(null);
 
-      // Try ZXing image decode
-      try {
-        const result = await codeReaderRef.current.decodeFromImageUrl(imgUrl);
-        if (result) {
-          const text = result.getText();
-          console.log('[IMAGE QR TEST SUCCESS - ZXING]', text);
-          setRawDecodedText(text);
-          onScan(text);
-          return;
-        }
-      } catch {
-        // Fallback to jsQR image canvas decode
-        const img = new Image();
-        img.onload = () => {
-          const canvas = document.createElement('canvas');
-          const ctx = canvas.getContext('2d');
-          canvas.width = img.width;
-          canvas.height = img.height;
-          if (ctx) {
-            ctx.drawImage(img, 0, 0);
-            const imageData = ctx.getImageData(0, 0, img.width, img.height);
-            const code = jsQR(imageData.data, imageData.width, imageData.height);
-            if (code && code.data) {
-              console.log('[IMAGE QR TEST SUCCESS - JSQR]', code.data);
-              setRawDecodedText(code.data);
-              onScan(code.data);
-              return;
-            }
-          }
-          alert('Unable to read QR code from uploaded image. Ensure the image is clear and well lit.');
-        };
-        img.src = imgUrl;
+    try {
+      console.log('[IMAGE DECODER INITIATED] Processing uploaded file:', file.name, file.type, file.size, 'bytes');
+      const res = await decodeQRFromImageFile(file);
+      setImageDecodeInfo(res);
+
+      if (res.success && res.text) {
+        console.log('[IMAGE QR DECODE SUCCESS]', res.text);
+        setRawDecodedText(res.text);
+        onScan(res.text);
+      } else {
+        console.warn('[IMAGE QR DECODE FAILED]', res.error);
+        if (onError) onError('Unable to decode this QR image.');
       }
     } catch (err: any) {
-      console.warn('[IMAGE QR TEST FAILED]', err);
-      alert('Unable to decode QR from image file.');
+      console.error('[IMAGE QR DECODE ERROR]', err);
+      if (onError) onError('Unable to decode this QR image.');
     } finally {
+      setIsDecodingImage(false);
       if (e.target) e.target.value = '';
     }
   };
@@ -463,6 +444,49 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
           <div className="break-all font-bold text-white bg-slate-900/80 p-2 rounded border border-emerald-900">
             RAW: {rawDecodedText}
           </div>
+        </div>
+      )}
+
+      {/* Section 7: Image Decoding Diagnostic Display Panel (Dev Mode & Diagnostic toolbar) */}
+      {imageDecodeInfo && (
+        <div className="p-3.5 bg-slate-900 border border-slate-700 rounded-xl space-y-2 font-mono text-xs text-slate-200 shadow-xl text-left">
+          <div className="flex justify-between items-center font-bold text-indigo-400 border-b border-slate-800 pb-1.5">
+            <span className="flex items-center gap-1.5">
+              <Upload size={14} className="text-cyan-400" /> IMAGE QR DECODER DIAGNOSTICS
+            </span>
+            <span className={imageDecodeInfo.success ? 'text-emerald-400 font-bold flex items-center gap-1' : 'text-rose-400 font-bold flex items-center gap-1'}>
+              {imageDecodeInfo.success ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+              {imageDecodeInfo.success ? '✓ DECODED' : '✕ FAILED'}
+            </span>
+          </div>
+
+          <div className="space-y-1 text-[11px] text-slate-300">
+            <div>Image loaded: <strong className="text-emerald-400">YES</strong></div>
+            <div>Image dimensions: <strong>{imageDecodeInfo.dimensions.width} × {imageDecodeInfo.dimensions.height}</strong></div>
+            {imageDecodeInfo.attempts.map((att) => (
+              <div key={att.attemptIndex} className="flex justify-between items-center py-0.5 border-b border-slate-800/40">
+                <span className="text-slate-400">Decoder attempt {att.attemptIndex} ({att.engine}):</span>
+                <strong className={att.status === 'SUCCESS' ? 'text-emerald-400' : 'text-slate-500'}>
+                  {att.status}
+                </strong>
+              </div>
+            ))}
+          </div>
+
+          {imageDecodeInfo.success && imageDecodeInfo.text && (
+            <div className="pt-2 border-t border-slate-800 space-y-1">
+              <span className="block font-bold text-emerald-400">Decoded:</span>
+              <div className="p-2 bg-slate-950 rounded border border-emerald-800 text-white break-all font-bold">
+                {imageDecodeInfo.text}
+              </div>
+            </div>
+          )}
+
+          {!imageDecodeInfo.success && (
+            <div className="pt-1 text-rose-400 font-bold text-center">
+              Unable to decode this QR image.
+            </div>
+          )}
         </div>
       )}
 

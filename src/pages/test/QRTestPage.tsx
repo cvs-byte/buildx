@@ -3,6 +3,7 @@ import { BrowserQRCodeReader, BarcodeFormat, IScannerControls } from '@zxing/bro
 import { DecodeHintType } from '@zxing/library';
 import { Camera, RefreshCw, Play, Square, Upload, ShieldCheck, ShieldAlert, Cpu, CheckCircle2, AlertTriangle, KeyRound } from 'lucide-react';
 import { Button } from '../../components/common/Button';
+import { decodeQRFromImageFile, ImageQRDecodeResult } from '../../utils/qrImageDecoder';
 
 export const QRTestPage: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -221,25 +222,29 @@ export const QRTestPage: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
+  const [testADiagnostics, setTestADiagnostics] = useState<ImageQRDecodeResult | null>(null);
+
   // STEP 11 & 12: Test A — Image QR Upload Decoder Test
   const handleTestImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    setTestADiagnostics(null);
+    setImageQRResult(null);
+
     try {
-      if (!codeReaderRef.current) {
-        codeReaderRef.current = new BrowserQRCodeReader();
-      }
-      const imgUrl = URL.createObjectURL(file);
-      const result = await codeReaderRef.current.decodeFromImageUrl(imgUrl);
-      if (result) {
-        const text = result.getText();
-        console.log('[IMAGE QR SUCCESS]', text);
-        setImageQRResult(text);
+      const res = await decodeQRFromImageFile(file);
+      setTestADiagnostics(res);
+
+      if (res.success && res.text) {
+        console.log('[IMAGE QR SUCCESS]', res.text);
+        setImageQRResult(res.text);
+      } else {
+        alert('Unable to decode this QR image.');
       }
     } catch (err: any) {
       console.warn('[IMAGE QR FAILED]', err);
-      alert('Unable to decode QR from image file. Ensure the QR image is clear.');
+      alert('Unable to decode QR from image file.');
     } finally {
       if (e.target) e.target.value = '';
     }
@@ -447,6 +452,37 @@ export const QRTestPage: React.FC = () => {
             Upload QR Image File
           </Button>
         </div>
+
+        {testADiagnostics && (
+          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl space-y-2 font-mono text-xs text-slate-200 text-left">
+            <div className="flex justify-between items-center font-bold text-indigo-400 border-b border-slate-800 pb-1">
+              <span>TEST A DECODER DIAGNOSTICS</span>
+              <span className={testADiagnostics.success ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'}>
+                {testADiagnostics.success ? '✓ DECODED' : '✕ FAILED'}
+              </span>
+            </div>
+            <div className="space-y-1 text-[11px] text-slate-300">
+              <div>Image loaded: <strong className="text-emerald-400">YES</strong></div>
+              <div>Image dimensions: <strong>{testADiagnostics.dimensions.width} × {testADiagnostics.dimensions.height}</strong></div>
+              {testADiagnostics.attempts.map((att) => (
+                <div key={att.attemptIndex} className="flex justify-between items-center py-0.5 border-b border-slate-800/40">
+                  <span className="text-slate-400">Decoder attempt {att.attemptIndex} ({att.engine}):</span>
+                  <strong className={att.status === 'SUCCESS' ? 'text-emerald-400' : 'text-slate-500'}>
+                    {att.status}
+                  </strong>
+                </div>
+              ))}
+            </div>
+            {testADiagnostics.success && testADiagnostics.text && (
+              <div className="pt-2 border-t border-slate-800 space-y-1">
+                <span className="block font-bold text-emerald-400">Decoded:</span>
+                <div className="p-2 bg-slate-900 rounded border border-emerald-800 text-white break-all font-bold">
+                  {testADiagnostics.text}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {imageQRResult && (
           <div className="p-3 bg-purple-950/60 border border-purple-800 rounded-xl text-left space-y-1 font-mono text-xs text-purple-200">
