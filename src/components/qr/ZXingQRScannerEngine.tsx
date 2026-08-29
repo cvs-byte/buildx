@@ -39,6 +39,14 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
   const [isInitializing, setIsInitializing] = useState<boolean>(true);
   const [isSecure, setIsSecure] = useState<boolean>(true);
 
+  // Section 21 Diagnostics State
+  const [permissionState, setPermissionState] = useState<'UNKNOWN' | 'GRANTED' | 'DENIED'>('UNKNOWN');
+  const [cameraState, setCameraState] = useState<'INITIALIZING' | 'READY' | 'ERROR' | 'STOPPED'>('STOPPED');
+  const [decoderState, setDecoderState] = useState<'STOPPED' | 'RUNNING'>('STOPPED');
+  const [qrSearchState, setQrSearchState] = useState<'SEARCHING' | 'DETECTED'>('SEARCHING');
+  const [hasMediaDevices, setHasMediaDevices] = useState<boolean>(true);
+  const [hasGetUserMedia, setHasGetUserMedia] = useState<boolean>(true);
+
   // Diagnostics & Heartbeat state (Section 5 & 9 & 11)
   const [rawDecodedText, setRawDecodedText] = useState<string | null>(null);
   const [scanAttempts, setScanAttempts] = useState<number>(0);
@@ -50,18 +58,30 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
 
   const detectedLockRef = useRef<boolean>(false);
 
-  // Check Secure Context (HTTPS or localhost)
+  // Check Secure Context (HTTPS or localhost) & Media Devices Support
   useEffect(() => {
-    const secure = window.isSecureContext || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    const secure = Boolean(window.isSecureContext || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+    const mediaDev = Boolean(navigator && navigator.mediaDevices);
+    const getUM = Boolean(navigator && navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function');
+
     setIsSecure(secure);
+    setHasMediaDevices(mediaDev);
+    setHasGetUserMedia(getUM);
+
     if (!secure) {
-      const err = 'Camera access requires HTTPS context. Please load site over https://';
+      const err = 'CAMERA REQUIRES HTTPS context. Please load site over https://';
       setCameraError(err);
+      setCameraState('ERROR');
+      if (onError) onError(err);
+    } else if (!mediaDev || !getUM) {
+      const err = 'CAMERA API NOT SUPPORTED BY BROWSER';
+      setCameraError(err);
+      setCameraState('ERROR');
       if (onError) onError(err);
     }
   }, [onError]);
 
-  // Clean up media streams, timers, and ZXing controls completely (Section 26 & 27)
+  // Clean up media streams, timers, and ZXing controls completely (Section 15 & 26 & 27)
   const stopScannerControls = useCallback(() => {
     if (jsQRIntervalRef.current !== null) {
       clearInterval(jsQRIntervalRef.current);
@@ -93,6 +113,9 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
         console.warn('[VIDEO SRC CLEAR WARN]', err);
       }
     }
+
+    setCameraState('STOPPED');
+    setDecoderState('STOPPED');
   }, []);
 
   const handleQRDetected = useCallback(
@@ -110,169 +133,239 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
     [isPaused, onScan]
   );
 
-  // Main Camera Scanner Initialization using ZXing + jsQR dual-engine (Section 3, 4, 5, 6, 7)
+  // Main Camera Scanner Initialization (Section 1-17)
   const startCameraScanner = useCallback(
     async (targetDeviceId?: string) => {
       stopScannerControls();
       detectedLockRef.current = false;
       setCameraError(null);
       setIsInitializing(true);
+      setCameraState('INITIALIZING');
+      setDecoderState('STOPPED');
+      setQrSearchState('SEARCHING');
       setCameraStateText('Initializing camera...');
       if (onStatusChange) onStatusChange('Initializing camera...');
 
+      // Section 3: Verify Secure Context (HTTPS or localhost)
       if (!window.isSecureContext && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-        const err = 'Camera permission denied or non-HTTPS environment.';
-        setCameraError(err);
+        const err = 'CAMERA REQUIRES HTTPS';
+        setCameraError('CAMERA REQUIRES HTTPS\nPlease load this page over https:// to enable camera scanning.');
+        setCameraState('ERROR');
         setIsInitializing(false);
-        setCameraStateText('Camera unavailable');
-        if (onStatusChange) onStatusChange('Camera unavailable');
+        setCameraStateText(err);
+        if (onStatusChange) onStatusChange(err);
         return;
       }
 
+      // Section 2: Verify Browser MediaDevices API
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        const err = 'CAMERA API NOT SUPPORTED BY BROWSER';
+        setCameraError('CAMERA API NOT SUPPORTED BY BROWSER\nYour browser or webview does not expose navigator.mediaDevices.getUserMedia.');
+        setCameraState('ERROR');
+        setIsInitializing(false);
+        setCameraStateText(err);
+        if (onStatusChange) onStatusChange(err);
+        return;
+      }
+
+      // Section 5: Simple Camera Access Test First (Lightweight getUserMedia request to prompt permission)
+      let initialStream: MediaStream | null = null;
       try {
-        // High-precision ZXing hints: TRY_HARDER = true for low contrast / tilted codes
-        const hints = new Map();
-        hints.set(DecodeHintType.TRY_HARDER, true);
-        hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE]);
-
-        if (!codeReaderRef.current) {
-          codeReaderRef.current = new BrowserQRCodeReader(hints, {
-            delayBetweenScanAttempts: 80,
-            delayBetweenScanSuccess: 1000,
-          });
-        }
-
-        // List available camera devices (Section 4)
-        let devices: MediaDeviceInfo[] = [];
-        try {
-          devices = await BrowserQRCodeReader.listVideoInputDevices();
-          const mappedDevices: CameraDeviceInfo[] = devices.map((d, idx) => ({
-            deviceId: d.deviceId,
-            label: d.label || `Camera ${idx + 1}`,
-          }));
-          setAvailableDevices(mappedDevices);
-        } catch (err) {
-          console.warn('[DEVICE LIST WARN]', err);
-        }
-
-        // Prefer rear/environment camera
-        let chosenDeviceId = targetDeviceId || selectedDeviceId;
-        if (!chosenDeviceId && devices.length > 0) {
-          const rearCam = devices.find(
-            (d) =>
-              d.label.toLowerCase().includes('back') ||
-              d.label.toLowerCase().includes('rear') ||
-              d.label.toLowerCase().includes('environment') ||
-              d.label.toLowerCase().includes('facing back')
-          );
-          chosenDeviceId = rearCam ? rearCam.deviceId : devices[devices.length - 1].deviceId;
-        }
-        setSelectedDeviceId(chosenDeviceId || '');
-
-        const videoElement = videoRef.current;
-        if (!videoElement) {
-          setIsInitializing(false);
-          setCameraError('Video element not mounted.');
-          return;
-        }
-
-        videoElement.setAttribute('autoplay', 'true');
-        videoElement.setAttribute('playsinline', 'true');
-        videoElement.setAttribute('muted', 'true');
-
-        const constraints: MediaStreamConstraints = {
-          video: chosenDeviceId
-            ? { deviceId: { exact: chosenDeviceId } }
-            : {
-                facingMode: { ideal: 'environment' },
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
-                frameRate: { ideal: 30 },
-              },
-          audio: false,
-        };
-
-        // 1. Start stream & ZXing continuous decoder
-        const controls = await codeReaderRef.current.decodeFromConstraints(
-          constraints,
-          videoElement,
-          (result, error) => {
-            setScanAttempts((prev) => prev + 1);
-
-            if (result) {
-              const text = result.getText();
-              if (text && text.trim() !== '') {
-                handleQRDetected(text);
-              }
-            }
-            // Non-fatal missed frame errors (NotFoundException) are handled silently
-          }
-        );
-
-        controlsRef.current = controls;
-
-        // 2. Camera Health Check & Readiness verification (Section 5)
-        let verifyRetries = 0;
-        while ((videoElement.readyState < 2 || videoElement.videoWidth === 0) && verifyRetries < 25) {
-          await new Promise((r) => setTimeout(r, 80));
-          verifyRetries++;
-        }
-
-        const width = videoElement.videoWidth || 0;
-        const height = videoElement.videoHeight || 0;
-        setVideoDimensions({ width, height });
-
-        console.log('Camera ready:', {
-          readyState: videoElement.readyState,
-          width,
-          height,
-        });
-
-        // 3. Parallel jsQR 60fps canvas sampling engine for instant sub-100ms detection
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-
-        jsQRIntervalRef.current = window.setInterval(() => {
-          if (detectedLockRef.current || isPaused || !videoElement || videoElement.readyState < 2) return;
-          if (ctx && videoElement.videoWidth > 0 && videoElement.videoHeight > 0) {
-            canvas.width = videoElement.videoWidth;
-            canvas.height = videoElement.videoHeight;
-            ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const code = jsQR(imageData.data, imageData.width, imageData.height, {
-              inversionAttempts: 'dontInvert',
-            });
-            if (code && code.data && code.data.trim() !== '') {
-              handleQRDetected(code.data);
-            }
-          }
-        }, 100);
-
-        setIsInitializing(false);
-        setCameraStateText('Camera ready — scan a student QR');
-        if (onStatusChange) onStatusChange('Camera ready — scan a student QR');
+        console.log('[CAMERA INIT] Stage 1: Requesting simple getUserMedia ({ video: true })...');
+        initialStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        setPermissionState('GRANTED');
+        console.log('[CAMERA INIT] Stage 1 SUCCESS: Camera permission granted.');
       } catch (err: any) {
-        console.error('[ZXING CAMERA INIT ERROR]', err);
+        console.error('[CAMERA ERROR]', err);
+        console.error('name:', err?.name);
+        console.error('message:', err?.message);
+
         setIsInitializing(false);
+        setCameraState('ERROR');
 
         let userMsg = 'Camera initialization failed.';
         if (err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError') {
-          userMsg = 'Camera permission denied. Please allow camera access in browser settings and press Retry.';
+          userMsg = 'CAMERA PERMISSION BLOCKED\n\nAllow camera access for this website in your browser settings, then press Retry Camera.';
+          setPermissionState('DENIED');
           if (onStatusChange) onStatusChange('Camera permission denied');
         } else if (err?.name === 'NotFoundError' || err?.name === 'DevicesNotFoundError') {
-          userMsg = 'No camera device found on this device.';
+          userMsg = 'NO CAMERA DETECTED\n\nThis browser/device did not expose a camera.';
           if (onStatusChange) onStatusChange('Camera unavailable');
         } else if (err?.name === 'NotReadableError' || err?.name === 'TrackStartError') {
-          userMsg = 'Camera is currently in use by another application.';
+          userMsg = 'CAMERA IS BUSY\n\nAnother application or browser tab may be using the camera. Close it and press Retry Camera.';
           if (onStatusChange) onStatusChange('Camera unavailable');
         } else {
+          userMsg = `Camera error (${err?.name || 'Unknown'}): ${err?.message || 'Failed to open video stream.'}`;
           if (onStatusChange) onStatusChange('Camera unavailable');
         }
 
         setCameraError(userMsg);
         setCameraStateText(userMsg);
         if (onError) onError(userMsg);
+        return;
       }
+
+      // Section 15: Stop initial test stream tracks before proceeding to device selection
+      initialStream.getTracks().forEach((track) => track.stop());
+
+      // Section 6: Enumerate Camera Devices after permission granted
+      let devices: MediaDeviceInfo[] = [];
+      try {
+        const rawDevices = await navigator.mediaDevices.enumerateDevices();
+        devices = rawDevices.filter((d) => d.kind === 'videoinput');
+        const mappedDevices: CameraDeviceInfo[] = devices.map((d, idx) => ({
+          deviceId: d.deviceId,
+          label: d.label || `Camera ${idx + 1}`,
+        }));
+        setAvailableDevices(mappedDevices);
+        console.log('[CAMERA DEVICES ENUMERATED]', mappedDevices);
+      } catch (err) {
+        console.warn('[DEVICE ENUMERATION WARN]', err);
+      }
+
+      // Section 7 & 8: Rear Camera Preference & Fallback Camera Selection
+      let chosenDeviceId = targetDeviceId || selectedDeviceId;
+      if (!chosenDeviceId && devices.length > 0) {
+        const rearCam = devices.find(
+          (d) =>
+            d.label.toLowerCase().includes('back') ||
+            d.label.toLowerCase().includes('rear') ||
+            d.label.toLowerCase().includes('environment') ||
+            d.label.toLowerCase().includes('facing back')
+        );
+        chosenDeviceId = rearCam ? rearCam.deviceId : devices[0].deviceId;
+      }
+      if (chosenDeviceId) {
+        setSelectedDeviceId(chosenDeviceId);
+      }
+
+      // Section 7: Use ideal constraint, NEVER exact facingMode
+      let constraints: MediaStreamConstraints;
+      if (targetDeviceId) {
+        constraints = { video: { deviceId: { exact: targetDeviceId } }, audio: false };
+      } else if (chosenDeviceId && devices.length > 0) {
+        constraints = { video: { deviceId: { ideal: chosenDeviceId } }, audio: false };
+      } else {
+        constraints = {
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        };
+      }
+
+      // Section 14: Overconstrained / Device Failure Fallback
+      let activeStream: MediaStream;
+      try {
+        activeStream = await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (constrErr: any) {
+        console.warn('[CAMERA CONSTRAINTS FALLBACK PROMPT]', constrErr?.name, constrErr?.message);
+        if (
+          constrErr?.name === 'OverconstrainedError' ||
+          constrErr?.name === 'NotFoundError' ||
+          constrErr?.name === 'NotReadableError'
+        ) {
+          console.log('[CAMERA FALLBACK] Retrying generic video constraints ({ video: true })...');
+          activeStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        } else {
+          throw constrErr;
+        }
+      }
+
+      mediaStreamRef.current = activeStream;
+
+      // Section 9: Attach stream to video element and verify readyState & dimensions > 0
+      const videoElement = videoRef.current;
+      if (!videoElement) {
+        setIsInitializing(false);
+        setCameraState('ERROR');
+        setCameraError('Video DOM element not mounted.');
+        return;
+      }
+
+      videoElement.setAttribute('autoplay', 'true');
+      videoElement.setAttribute('playsinline', 'true');
+      videoElement.setAttribute('muted', 'true');
+      videoElement.srcObject = activeStream;
+      await videoElement.play();
+
+      let verifyRetries = 0;
+      while ((videoElement.readyState < 2 || videoElement.videoWidth === 0) && verifyRetries < 30) {
+        await new Promise((r) => setTimeout(r, 80));
+        verifyRetries++;
+      }
+
+      const width = videoElement.videoWidth || 0;
+      const height = videoElement.videoHeight || 0;
+      setVideoDimensions({ width, height });
+
+      if (width === 0 || height === 0) {
+        setIsInitializing(false);
+        setCameraState('ERROR');
+        setCameraError('Camera stream returned 0x0 video dimensions.');
+        return;
+      }
+
+      setCameraState('READY');
+      console.log('Camera stream READY:', { readyState: videoElement.readyState, width, height });
+
+      // Section 9 & 17: START QR DECODER ONLY AFTER CAMERA IS READY
+      const hints = new Map();
+      hints.set(DecodeHintType.TRY_HARDER, true);
+      hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE]);
+
+      if (!codeReaderRef.current) {
+        codeReaderRef.current = new BrowserQRCodeReader(hints, {
+          delayBetweenScanAttempts: 80,
+          delayBetweenScanSuccess: 1000,
+        });
+      }
+
+      const controls = await codeReaderRef.current.decodeFromVideoElement(
+        videoElement,
+        (result, error) => {
+          setScanAttempts((prev) => prev + 1);
+
+          if (result) {
+            const text = result.getText();
+            if (text && text.trim() !== '') {
+              setQrSearchState('DETECTED');
+              handleQRDetected(text);
+            }
+          }
+          // Section 18: No-QR frames (NotFoundException) are normal, scanner continues continuously
+        }
+      );
+
+      controlsRef.current = controls;
+      setDecoderState('RUNNING');
+
+      // Section 17: Parallel jsQR canvas sampling engine
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+      jsQRIntervalRef.current = window.setInterval(() => {
+        if (detectedLockRef.current || isPaused || !videoElement || videoElement.readyState < 2) return;
+        if (ctx && videoElement.videoWidth > 0 && videoElement.videoHeight > 0) {
+          canvas.width = videoElement.videoWidth;
+          canvas.height = videoElement.videoHeight;
+          ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const code = jsQR(imageData.data, imageData.width, imageData.height, {
+            inversionAttempts: 'dontInvert',
+          });
+          if (code && code.data && code.data.trim() !== '') {
+            setQrSearchState('DETECTED');
+            handleQRDetected(code.data);
+          }
+        }
+      }, 100);
+
+      setIsInitializing(false);
+      setCameraStateText('Camera ready — scan a student QR');
+      if (onStatusChange) onStatusChange('Camera ready — scan a student QR');
     },
     [selectedDeviceId, stopScannerControls, handleQRDetected, onError, onStatusChange, isPaused]
   );
@@ -421,16 +514,82 @@ export const ZXingQRScannerEngine: React.FC<ZXingQRScannerEngineProps> = ({
         )}
       </div>
 
-      {/* Diagnostics Status Banner (Section 5, 9, 11) */}
-      <div className="bg-slate-900/90 border border-slate-800 p-2.5 rounded-xl text-xs font-mono text-slate-300 flex flex-wrap justify-between items-center gap-2">
-        <div>
-          Camera: <span className="text-emerald-400 font-bold">{videoDimensions.width > 0 ? `READY (${videoDimensions.width}×${videoDimensions.height})` : 'INITIALIZING'}</span>
+      {/* Section 21: Mandatory Camera & System Diagnostics Panel */}
+      <div className="bg-slate-900 border border-slate-800 p-3 rounded-xl space-y-2 text-xs font-mono text-slate-300 text-left shadow-lg">
+        <div className="flex justify-between items-center border-b border-slate-800 pb-1 text-[11px] font-bold text-indigo-400">
+          <span>SYSTEM & CAMERA DIAGNOSTICS</span>
+          <span className="text-slate-500 font-normal">Section 21</span>
         </div>
-        <div>
-          Decoder: <span className="text-cyan-400 font-bold">{isPaused ? 'PAUSED' : 'RUNNING'}</span>
-        </div>
-        <div>
-          QR: <span className="text-purple-300">{rawDecodedText ? 'DETECTED ✓' : 'SEARCHING'}</span>
+
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-[11px]">
+          <div>
+            Secure Context:{' '}
+            <strong className={isSecure ? 'text-emerald-400' : 'text-rose-400'}>
+              {isSecure ? 'YES' : 'NO'}
+            </strong>
+          </div>
+          <div>
+            mediaDevices:{' '}
+            <strong className={hasMediaDevices ? 'text-emerald-400' : 'text-rose-400'}>
+              {hasMediaDevices ? 'YES' : 'NO'}
+            </strong>
+          </div>
+          <div>
+            getUserMedia:{' '}
+            <strong className={hasGetUserMedia ? 'text-emerald-400' : 'text-rose-400'}>
+              {hasGetUserMedia ? 'YES' : 'NO'}
+            </strong>
+          </div>
+          <div>
+            Permission:{' '}
+            <strong
+              className={
+                permissionState === 'GRANTED'
+                  ? 'text-emerald-400'
+                  : permissionState === 'DENIED'
+                  ? 'text-rose-400'
+                  : 'text-amber-400'
+              }
+            >
+              {permissionState}
+            </strong>
+          </div>
+          <div>
+            Video Inputs:{' '}
+            <strong className="text-cyan-300">{availableDevices.length}</strong>
+          </div>
+          <div>
+            Camera State:{' '}
+            <strong
+              className={
+                cameraState === 'READY'
+                  ? 'text-emerald-400'
+                  : cameraState === 'ERROR'
+                  ? 'text-rose-400'
+                  : 'text-amber-400'
+              }
+            >
+              {cameraState}
+            </strong>
+          </div>
+          <div>
+            Video:{' '}
+            <strong className="text-cyan-300 font-bold">
+              {videoDimensions.width > 0 ? `${videoDimensions.width} × ${videoDimensions.height}` : '0 × 0'}
+            </strong>
+          </div>
+          <div>
+            Decoder:{' '}
+            <strong className={decoderState === 'RUNNING' ? 'text-cyan-400' : 'text-slate-400'}>
+              {decoderState}
+            </strong>
+          </div>
+          <div>
+            QR Status:{' '}
+            <strong className={qrSearchState === 'DETECTED' ? 'text-emerald-400 font-bold' : 'text-purple-300'}>
+              {qrSearchState}
+            </strong>
+          </div>
         </div>
       </div>
 
